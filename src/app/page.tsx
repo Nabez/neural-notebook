@@ -12,7 +12,8 @@ import {
   ZoomIn, ZoomOut, Maximize, FolderPlus, FileText, 
   Hand, MousePointer, Grid3X3, Circle, X,
   Sun, Moon, Plus, Palette, Trash2, Download, Upload,
-  Square, Triangle, Minus, Link2, Code2, Type
+  Square, Triangle, Minus, Link2, Code2, Type,
+  Undo2, Redo2, Copy, Clipboard, Lock, Unlock, RotateCcw
 } from 'lucide-react'
 import dynamic from 'next/dynamic'
 
@@ -30,6 +31,8 @@ interface Note {
   canvasY: number
   canvasWidth: number
   canvasHeight: number
+  rotation?: number
+  locked?: boolean
   type: 'TEXT' | 'CANVAS' | 'STICKY'
   tags: string[]
   folderId?: string
@@ -45,6 +48,8 @@ interface Folder {
   canvasY: number
   canvasWidth: number
   canvasHeight: number
+  rotation?: number
+  locked?: boolean
   parentId?: string
 }
 
@@ -55,6 +60,8 @@ interface CanvasElement {
   y: number
   width: number
   height: number
+  rotation?: number
+  locked?: boolean
   endX?: number
   endY?: number
   color: string
@@ -66,19 +73,30 @@ interface CanvasElement {
   fontSize?: number
   blockType?: 'input' | 'process' | 'output' | 'condition' | 'loop'
   code?: string
+  // Ports for SimBlock
+  ports?: { id: string; type: 'input' | 'output'; x: number; y: number }[]
 }
 
-// Connection between elements
 interface Connection {
   id: string
   fromId: string
+  fromPort?: string
   fromAnchor: 'top' | 'right' | 'bottom' | 'left'
   toId: string
+  toPort?: string
   toAnchor: 'top' | 'right' | 'bottom' | 'left'
   color: string
   strokeWidth: number
   label?: string
   animated?: boolean
+}
+
+// History for Undo/Redo
+interface HistoryState {
+  notes: Note[]
+  folders: Folder[]
+  canvasElements: CanvasElement[]
+  connections: Connection[]
 }
 
 type GridType = 'dots' | 'lines' | 'none'
@@ -98,8 +116,11 @@ const SIM_BLOCK_TYPES = [
   { type: 'loop', label: 'Loop', color: '#ef4444', icon: '🔄' },
 ]
 
+const HANDLE_SIZE = 8
+const ROTATE_HANDLE_OFFSET = 20
+
 // ═════════════════════════════════════════════════════════════════
-// HELPER: Get anchor point position
+// HELPER FUNCTIONS
 // ═════════════════════════════════════════════════════════════════
 
 function getAnchorPosition(
@@ -108,7 +129,6 @@ function getAnchorPosition(
 ): { x: number; y: number } {
   const cx = element.x + element.width / 2
   const cy = element.y + element.height / 2
-  
   switch (anchor) {
     case 'top': return { x: cx, y: element.y }
     case 'right': return { x: element.x + element.width, y: cy }
@@ -130,20 +150,23 @@ function getBestAnchor(
   const dy = toCy - fromCy
   
   if (Math.abs(dx) > Math.abs(dy)) {
-    // Horizontal connection
-    if (dx > 0) {
-      return { fromAnchor: 'right', toAnchor: 'left' }
-    } else {
-      return { fromAnchor: 'left', toAnchor: 'right' }
-    }
+    return dx > 0 
+      ? { fromAnchor: 'right', toAnchor: 'left' }
+      : { fromAnchor: 'left', toAnchor: 'right' }
   } else {
-    // Vertical connection
-    if (dy > 0) {
-      return { fromAnchor: 'bottom', toAnchor: 'top' }
-    } else {
-      return { fromAnchor: 'top', toAnchor: 'bottom' }
-    }
+    return dy > 0 
+      ? { fromAnchor: 'bottom', toAnchor: 'top' }
+      : { fromAnchor: 'top', toAnchor: 'bottom' }
   }
+}
+
+function rotatePoint(px: number, py: number, cx: number, cy: number, angle: number): { x: number; y: number } {
+  const rad = (angle * Math.PI) / 180
+  const cos = Math.cos(rad)
+  const sin = Math.sin(rad)
+  const nx = cos * (px - cx) - sin * (py - cy) + cx
+  const ny = sin * (px - cx) + cos * (py - cy) + cy
+  return { x: nx, y: ny }
 }
 
 // ═════════════════════════════════════════════════════════════════
@@ -164,8 +187,23 @@ export default function NeuralNotebook() {
   const [folders, setFolders] = useState<Folder[]>([])
   const [canvasElements, setCanvasElements] = useState<CanvasElement[]>([])
   const [connections, setConnections] = useState<Connection[]>([])
-  const [selectedId, setSelectedId] = useState<string | null>(null)
+  const [selectedIds, setSelectedIds] = useState<Set<string>>(new Set())
   const [selectedType, setSelectedType] = useState<'note' | 'folder' | 'element' | 'connection' | null>(null)
+  
+  // Multi-select
+  const [selectionBox, setSelectionBox] = useState<{ startX: number; startY: number; endX: number; endY: number } | null>(null)
+  
+  // Resize/Rotate
+  const [resizing, setResizing] = useState<{ id: string; handle: string; startX: number; startY: number; startBounds: any } | null>(null)
+  const [rotating, setRotating] = useState<{ id: string; startAngle: number; startRotation: number; cx: number; cy: number } | null>(null)
+  
+  // History (Undo/Redo)
+  const [history, setHistory] = useState<HistoryState[]>([])
+  const [historyIndex, setHistoryIndex] = useState(-1)
+  const isUndoRedo = useRef(false)
+  
+  // Clipboard
+  const [clipboard, setClipboard] = useState<{ elements: CanvasElement[]; notes: Note[] } | null>(null)
   
   // Drawing State
   const [isDrawing, setIsDrawing] = useState(false)
@@ -175,7 +213,7 @@ export default function NeuralNotebook() {
   const [selectedColor, setSelectedColor] = useState(SHAPE_COLORS[0])
   
   // Connect State
-  const [connectStart, setConnectStart] = useState<{ id: string; type: 'element' | 'note' | 'folder'; x: number; y: number } | null>(null)
+  const [connectStart, setConnectStart] = useState<{ id: string; type: 'element' | 'note' | 'folder'; port?: string } | null>(null)
   const [connectEnd, setConnectEnd] = useState<{ x: number; y: number } | null>(null)
   
   // UI State
@@ -187,13 +225,61 @@ export default function NeuralNotebook() {
   
   // Element drag
   const [elementDrag, setElementDrag] = useState<{
-    id: string
+    ids: string[]
     type: 'note' | 'folder' | 'element'
     startX: number
     startY: number
-    elementStartX: number
-    elementStartY: number
+    startPositions: Map<string, { x: number; y: number }>
   } | null>(null)
+
+  // ═════════════════════════════════════════════════════════════════
+  // HISTORY MANAGEMENT
+  // ═════════════════════════════════════════════════════════════════
+
+  const saveToHistory = useCallback(() => {
+    if (isUndoRedo.current) return
+    
+    const state: HistoryState = {
+      notes: JSON.parse(JSON.stringify(notes)),
+      folders: JSON.parse(JSON.stringify(folders)),
+      canvasElements: JSON.parse(JSON.stringify(canvasElements)),
+      connections: JSON.parse(JSON.stringify(connections))
+    }
+    
+    setHistory(prev => {
+      const newHistory = prev.slice(0, historyIndex + 1)
+      newHistory.push(state)
+      if (newHistory.length > 50) newHistory.shift()
+      return newHistory
+    })
+    setHistoryIndex(prev => Math.min(prev + 1, 49))
+  }, [notes, folders, canvasElements, connections, historyIndex])
+
+  const undo = useCallback(() => {
+    if (historyIndex <= 0) return
+    isUndoRedo.current = true
+    const prevState = history[historyIndex - 1]
+    setNotes(prevState.notes)
+    setFolders(prevState.folders)
+    setCanvasElements(prevState.canvasElements)
+    setConnections(prevState.connections)
+    setHistoryIndex(prev => prev - 1)
+    setSelectedIds(new Set())
+    requestAnimationFrame(() => { isUndoRedo.current = false })
+  }, [history, historyIndex])
+
+  const redo = useCallback(() => {
+    if (historyIndex >= history.length - 1) return
+    isUndoRedo.current = true
+    const nextState = history[historyIndex + 1]
+    setNotes(nextState.notes)
+    setFolders(nextState.folders)
+    setCanvasElements(nextState.canvasElements)
+    setConnections(nextState.connections)
+    setHistoryIndex(prev => prev + 1)
+    setSelectedIds(new Set())
+    requestAnimationFrame(() => { isUndoRedo.current = false })
+  }, [history, historyIndex])
 
   // ═════════════════════════════════════════════════════════════════
   // LOAD & SAVE DATA
@@ -213,6 +299,14 @@ export default function NeuralNotebook() {
           if (data.gridType) setGridType(data.gridType)
           if (data.theme) setTheme(data.theme)
           setIsLoaded(true)
+          // Initialize history
+          setHistory([{
+            notes: data.notes || [],
+            folders: data.folders || [],
+            canvasElements: data.canvasElements || [],
+            connections: data.connections || []
+          }])
+          setHistoryIndex(0)
         })
       } catch (e) {
         console.error('Failed to load data:', e)
@@ -229,6 +323,13 @@ export default function NeuralNotebook() {
     localStorage.setItem(STORAGE_KEY, JSON.stringify(data))
   }, [notes, folders, canvasElements, connections, viewport, gridType, theme, isLoaded])
 
+  // Save to history on changes
+  useEffect(() => {
+    if (!isLoaded || isUndoRedo.current) return
+    const timeout = setTimeout(saveToHistory, 500)
+    return () => clearTimeout(timeout)
+  }, [notes, folders, canvasElements, connections, isLoaded, saveToHistory])
+
   // ═════════════════════════════════════════════════════════════════
   // ELEMENT CREATION
   // ═════════════════════════════════════════════════════════════════
@@ -242,12 +343,14 @@ export default function NeuralNotebook() {
       canvasY: y,
       canvasWidth: type === 'STICKY' ? 200 : type === 'CANVAS' ? 400 : 320,
       canvasHeight: type === 'STICKY' ? 200 : type === 'CANVAS' ? 300 : 400,
+      rotation: 0,
+      locked: false,
       type,
       tags: [],
       color: type === 'STICKY' ? STICKY_COLORS[0] : undefined
     }
     setNotes(prev => [...prev, newNote])
-    setSelectedId(newNote.id)
+    setSelectedIds(new Set([newNote.id]))
     setSelectedType('note')
     if (type === 'CANVAS') setEditingNote(newNote)
     return newNote
@@ -261,10 +364,12 @@ export default function NeuralNotebook() {
       canvasX: x,
       canvasY: y,
       canvasWidth: 240,
-      canvasHeight: 180
+      canvasHeight: 180,
+      rotation: 0,
+      locked: false
     }
     setFolders(prev => [...prev, newFolder])
-    setSelectedId(newFolder.id)
+    setSelectedIds(new Set([newFolder.id]))
     setSelectedType('folder')
     return newFolder
   }, [])
@@ -272,10 +377,22 @@ export default function NeuralNotebook() {
   const createCanvasElement = useCallback((element: Omit<CanvasElement, 'id'>) => {
     const newElement: CanvasElement = {
       ...element,
-      id: `element-${Date.now()}`
+      id: `element-${Date.now()}`,
+      rotation: element.rotation ?? 0,
+      locked: element.locked ?? false
     }
+    
+    // Add ports for simblocks
+    if (newElement.type === 'simblock') {
+      newElement.ports = [
+        { id: `${newElement.id}-in1`, type: 'input', x: 0, y: 30 },
+        { id: `${newElement.id}-in2`, type: 'input', x: 0, y: 50 },
+        { id: `${newElement.id}-out1`, type: 'output', x: 160, y: 40 },
+      ]
+    }
+    
     setCanvasElements(prev => [...prev, newElement])
-    setSelectedId(newElement.id)
+    setSelectedIds(new Set([newElement.id]))
     setSelectedType('element')
     return newElement
   }, [])
@@ -283,8 +400,8 @@ export default function NeuralNotebook() {
   const createConnection = useCallback((
     fromId: string,
     toId: string,
-    fromAnchor?: 'top' | 'right' | 'bottom' | 'left',
-    toAnchor?: 'top' | 'right' | 'bottom' | 'left'
+    fromPort?: string,
+    toPort?: string
   ) => {
     const fromElement = canvasElements.find(e => e.id === fromId) || 
                         notes.find(n => n.id === fromId && { x: n.canvasX, y: n.canvasY, width: n.canvasWidth, height: n.canvasHeight })
@@ -301,9 +418,11 @@ export default function NeuralNotebook() {
     const newConnection: Connection = {
       id: `conn-${Date.now()}`,
       fromId,
-      fromAnchor: fromAnchor || bestAnchors.fromAnchor,
+      fromPort,
+      fromAnchor: bestAnchors.fromAnchor,
       toId,
-      toAnchor: toAnchor || bestAnchors.toAnchor,
+      toPort,
+      toAnchor: bestAnchors.toAnchor,
       color: '#6b7280',
       strokeWidth: 2,
       animated: true
@@ -311,6 +430,10 @@ export default function NeuralNotebook() {
     setConnections(prev => [...prev, newConnection])
     return newConnection
   }, [canvasElements, notes])
+
+  // ═════════════════════════════════════════════════════════════════
+  // UPDATE OPERATIONS
+  // ═════════════════════════════════════════════════════════════════
 
   const updateNote = useCallback((id: string, changes: Partial<Note>) => {
     setNotes(prev => prev.map(n => n.id === id ? { ...n, ...changes } : n))
@@ -324,28 +447,62 @@ export default function NeuralNotebook() {
     setCanvasElements(prev => prev.map(e => e.id === id ? { ...e, ...changes } : e))
   }, [])
 
-  const deleteNote = useCallback((id: string) => {
-    setNotes(prev => prev.filter(n => n.id !== id))
-    setConnections(prev => prev.filter(c => c.fromId !== id && c.toId !== id))
-    if (selectedId === id) { setSelectedId(null); setSelectedType(null) }
-  }, [selectedId])
+  const updateSelectedElements = useCallback((changes: Partial<CanvasElement>) => {
+    setCanvasElements(prev => prev.map(e => selectedIds.has(e.id) ? { ...e, ...changes } : e))
+  }, [selectedIds])
 
-  const deleteFolder = useCallback((id: string) => {
-    setFolders(prev => prev.filter(f => f.id !== id))
-    setConnections(prev => prev.filter(c => c.fromId !== id && c.toId !== id))
-    if (selectedId === id) { setSelectedId(null); setSelectedType(null) }
-  }, [selectedId])
+  // ═════════════════════════════════════════════════════════════════
+  // DELETE OPERATIONS
+  // ═════════════════════════════════════════════════════════════════
 
-  const deleteCanvasElement = useCallback((id: string) => {
-    setCanvasElements(prev => prev.filter(e => e.id !== id))
-    setConnections(prev => prev.filter(c => c.fromId !== id && c.toId !== id))
-    if (selectedId === id) { setSelectedId(null); setSelectedType(null) }
-  }, [selectedId])
+  const deleteSelected = useCallback(() => {
+    selectedIds.forEach(id => {
+      setNotes(prev => prev.filter(n => n.id !== id))
+      setFolders(prev => prev.filter(f => f.id !== id))
+      setCanvasElements(prev => prev.filter(e => e.id !== id))
+      setConnections(prev => prev.filter(c => c.fromId !== id && c.toId !== id))
+    })
+    setSelectedIds(new Set())
+    setSelectedType(null)
+  }, [selectedIds])
 
-  const deleteConnection = useCallback((id: string) => {
-    setConnections(prev => prev.filter(c => c.id !== id))
-    if (selectedId === id) { setSelectedId(null); setSelectedType(null) }
-  }, [selectedId])
+  // ═════════════════════════════════════════════════════════════════
+  // CLIPBOARD OPERATIONS
+  // ═════════════════════════════════════════════════════════════════
+
+  const copySelected = useCallback(() => {
+    const elements = canvasElements.filter(e => selectedIds.has(e.id))
+    const selectedNotes = notes.filter(n => selectedIds.has(n.id))
+    setClipboard({ elements, notes: selectedNotes })
+  }, [canvasElements, notes, selectedIds])
+
+  const pasteClipboard = useCallback(() => {
+    if (!clipboard) return
+    
+    const offset = 20
+    const newElements = clipboard.elements.map(e => ({
+      ...e,
+      id: `element-${Date.now()}-${Math.random().toString(36).substr(2, 9)}`,
+      x: e.x + offset,
+      y: e.y + offset
+    }))
+    
+    const newNotes = clipboard.notes.map(n => ({
+      ...n,
+      id: `note-${Date.now()}-${Math.random().toString(36).substr(2, 9)}`,
+      canvasX: n.canvasX + offset,
+      canvasY: n.canvasY + offset
+    }))
+    
+    setCanvasElements(prev => [...prev, ...newElements])
+    setNotes(prev => [...prev, ...newNotes])
+    setSelectedIds(new Set([...newElements.map(e => e.id), ...newNotes.map(n => n.id)]))
+  }, [clipboard])
+
+  const duplicateSelected = useCallback(() => {
+    copySelected()
+    setTimeout(() => pasteClipboard(), 0)
+  }, [copySelected, pasteClipboard])
 
   // ═════════════════════════════════════════════════════════════════
   // CANVAS INTERACTION
@@ -370,17 +527,19 @@ export default function NeuralNotebook() {
       return
     }
     
-    // Select mode - deselect
+    // Select mode - start selection box or deselect
     if (e.button === 0 && activeTool === 'select') {
-      setSelectedId(null)
-      setSelectedType(null)
+      if (!e.shiftKey) {
+        setSelectedIds(new Set())
+        setSelectedType(null)
+      }
+      setSelectionBox({ startX: coords.x, startY: coords.y, endX: coords.x, endY: coords.y })
       setConnectStart(null)
       return
     }
     
-    // Connect mode - handle clicks on elements
+    // Connect mode
     if (e.button === 0 && activeTool === 'connect') {
-      // This is handled in element mouse down
       return
     }
     
@@ -464,6 +623,8 @@ export default function NeuralNotebook() {
   }, [activeTool, viewport, getCanvasCoords, createNote, createFolder, shapeType, selectedColor])
 
   const handleCanvasMouseMove = useCallback((e: React.MouseEvent) => {
+    const coords = getCanvasCoords(e)
+    
     // Panning
     if (isDragging) {
       setViewport(prev => ({
@@ -474,16 +635,88 @@ export default function NeuralNotebook() {
       return
     }
     
+    // Selection box
+    if (selectionBox && activeTool === 'select') {
+      setSelectionBox(prev => prev ? { ...prev, endX: coords.x, endY: coords.y } : null)
+      return
+    }
+    
     // Connect mode - update temp line
     if (activeTool === 'connect' && connectStart) {
-      const coords = getCanvasCoords(e)
       setConnectEnd(coords)
+      return
+    }
+    
+    // Resizing
+    if (resizing) {
+      const dx = (e.clientX - resizing.startX) / viewport.zoom
+      const dy = (e.clientY - resizing.startY) / viewport.zoom
+      
+      const element = canvasElements.find(el => el.id === resizing.id)
+      if (!element) return
+      
+      let newBounds = { ...resizing.startBounds }
+      
+      switch (resizing.handle) {
+        case 'se':
+          newBounds.width = Math.max(20, resizing.startBounds.width + dx)
+          newBounds.height = Math.max(20, resizing.startBounds.height + dy)
+          break
+        case 'sw':
+          newBounds.x = resizing.startBounds.x + dx
+          newBounds.width = Math.max(20, resizing.startBounds.width - dx)
+          newBounds.height = Math.max(20, resizing.startBounds.height + dy)
+          break
+        case 'ne':
+          newBounds.y = resizing.startBounds.y + dy
+          newBounds.width = Math.max(20, resizing.startBounds.width + dx)
+          newBounds.height = Math.max(20, resizing.startBounds.height - dy)
+          break
+        case 'nw':
+          newBounds.x = resizing.startBounds.x + dx
+          newBounds.y = resizing.startBounds.y + dy
+          newBounds.width = Math.max(20, resizing.startBounds.width - dx)
+          newBounds.height = Math.max(20, resizing.startBounds.height - dy)
+          break
+      }
+      
+      updateCanvasElement(resizing.id, newBounds)
+      return
+    }
+    
+    // Rotating
+    if (rotating) {
+      const element = canvasElements.find(el => el.id === rotating.id)
+      if (!element) return
+      
+      const angle = Math.atan2(coords.y - rotating.cy, coords.x - rotating.cx)
+      const newRotation = rotating.startRotation + ((angle - rotating.startAngle) * 180) / Math.PI
+      updateCanvasElement(rotating.id, { rotation: newRotation })
+      return
+    }
+    
+    // Element dragging
+    if (elementDrag) {
+      const dx = (e.clientX - elementDrag.startX) / viewport.zoom
+      const dy = (e.clientY - elementDrag.startY) / viewport.zoom
+      
+      elementDrag.ids.forEach(id => {
+        const startPos = elementDrag.startPositions.get(id)
+        if (!startPos) return
+        
+        if (elementDrag.type === 'element') {
+          updateCanvasElement(id, { x: startPos.x + dx, y: startPos.y + dy })
+        } else if (elementDrag.type === 'note') {
+          updateNote(id, { canvasX: startPos.x + dx, canvasY: startPos.y + dy })
+        } else if (elementDrag.type === 'folder') {
+          updateFolder(id, { canvasX: startPos.x + dx, canvasY: startPos.y + dy })
+        }
+      })
+      return
     }
     
     // Drawing
     if (isDrawing && currentElement) {
-      const coords = getCanvasCoords(e)
-      
       if (currentElement.type === 'shape') {
         const width = coords.x - drawStart.x
         const height = coords.y - drawStart.y
@@ -502,11 +735,33 @@ export default function NeuralNotebook() {
         } : null)
       }
     }
-  }, [isDragging, dragStart, isDrawing, currentElement, drawStart, getCanvasCoords, activeTool, connectStart])
+  }, [isDragging, dragStart, selectionBox, activeTool, connectStart, isDrawing, currentElement, drawStart, getCanvasCoords, resizing, rotating, elementDrag, viewport.zoom, canvasElements, updateCanvasElement, updateNote, updateFolder])
 
   const handleCanvasMouseUp = useCallback(() => {
     setIsDragging(false)
     
+    // Selection box complete
+    if (selectionBox) {
+      const minX = Math.min(selectionBox.startX, selectionBox.endX)
+      const maxX = Math.max(selectionBox.startX, selectionBox.endX)
+      const minY = Math.min(selectionBox.startY, selectionBox.endY)
+      const maxY = Math.max(selectionBox.startY, selectionBox.endY)
+      
+      const selectedInBox = canvasElements.filter(e => 
+        e.x >= minX && e.x + e.width <= maxX &&
+        e.y >= minY && e.y + e.height <= maxY
+      )
+      
+      if (selectedInBox.length > 0) {
+        setSelectedIds(new Set(selectedInBox.map(e => e.id)))
+        setSelectedType('element')
+      }
+      
+      setSelectionBox(null)
+      return
+    }
+    
+    // Finish drawing
     if (isDrawing && currentElement && currentElement.id === 'temp') {
       const { ...elementData } = currentElement
       createCanvasElement(elementData)
@@ -515,7 +770,11 @@ export default function NeuralNotebook() {
     
     setIsDrawing(false)
     setElementDrag(null)
-  }, [isDrawing, currentElement, createCanvasElement])
+    setResizing(null)
+    setRotating(null)
+    setConnectStart(null)
+    setConnectEnd(null)
+  }, [selectionBox, isDrawing, currentElement, createCanvasElement, canvasElements])
 
   const handleWheel = useCallback((e: React.WheelEvent) => {
     if (e.ctrlKey || e.metaKey) {
@@ -531,79 +790,136 @@ export default function NeuralNotebook() {
   // ELEMENT INTERACTION
   // ═════════════════════════════════════════════════════════════════
 
-  const handleElementMouseDown = useCallback((e: React.MouseEvent, id: string, type: 'note' | 'folder' | 'element') => {
+  const handleElementMouseDown = useCallback((e: React.MouseEvent, id: string, type: 'note' | 'folder' | 'element', portId?: string) => {
     e.stopPropagation()
     
-    // Connect mode
+    // Check if locked
+    if (type === 'element') {
+      const el = canvasElements.find(e => e.id === id)
+      if (el?.locked) return
+    }
+    
+    // Connect mode with ports
     if (activeTool === 'connect') {
-      if (!connectStart) {
-        const element = type === 'element' ? canvasElements.find(el => el.id === id) :
-                        type === 'note' ? notes.find(n => n.id === id) :
-                        folders.find(f => f.id === id)
-        if (element) {
-          const pos = 'x' in element ? { x: element.x + element.width/2, y: element.y + element.height/2 } :
-                      { x: element.canvasX + element.canvasWidth/2, y: element.canvasY + element.canvasHeight/2 }
-          setConnectStart({ id, type, x: pos.x, y: pos.y })
+      if (portId) {
+        // Clicked on a port
+        if (!connectStart) {
+          setConnectStart({ id, type, port: portId })
+        } else {
+          if (connectStart.id !== id) {
+            createConnection(connectStart.id, id, connectStart.port, portId)
+          }
+          setConnectStart(null)
+          setConnectEnd(null)
         }
       } else {
-        // Complete connection
-        if (connectStart.id !== id) {
-          createConnection(connectStart.id, id)
+        // Clicked on element body
+        if (!connectStart) {
+          setConnectStart({ id, type })
+        } else {
+          if (connectStart.id !== id) {
+            createConnection(connectStart.id, id, connectStart.port)
+          }
+          setConnectStart(null)
+          setConnectEnd(null)
         }
-        setConnectStart(null)
-        setConnectEnd(null)
       }
       return
     }
     
-    // Select mode
-    setSelectedId(id)
-    setSelectedType(type)
-    
-    let element: { canvasX?: number; canvasY?: number; x?: number; y?: number } | undefined
-    if (type === 'note') element = notes.find(n => n.id === id)
-    else if (type === 'folder') element = folders.find(f => f.id === id)
-    else if (type === 'element') element = canvasElements.find(el => el.id === id)
-    
-    if (element) {
-      const startX = element.canvasX ?? element.x ?? 0
-      const startY = element.canvasY ?? element.y ?? 0
-      setElementDrag({
-        id,
-        type,
-        startX: e.clientX,
-        startY: e.clientY,
-        elementStartX: startX,
-        elementStartY: startY
+    // Select element
+    if (e.shiftKey) {
+      // Multi-select
+      setSelectedIds(prev => {
+        const next = new Set(prev)
+        if (next.has(id)) {
+          next.delete(id)
+        } else {
+          next.add(id)
+        }
+        return next
       })
-    }
-  }, [activeTool, connectStart, canvasElements, notes, folders, createConnection])
-
-  useEffect(() => {
-    if (!elementDrag) return
-    
-    const handleMouseMove = (e: MouseEvent) => {
-      const dx = (e.clientX - elementDrag.startX) / viewport.zoom
-      const dy = (e.clientY - elementDrag.startY) / viewport.zoom
-      
-      if (elementDrag.type === 'note') {
-        updateNote(elementDrag.id, { canvasX: elementDrag.elementStartX + dx, canvasY: elementDrag.elementStartY + dy })
-      } else if (elementDrag.type === 'folder') {
-        updateFolder(elementDrag.id, { canvasX: elementDrag.elementStartX + dx, canvasY: elementDrag.elementStartY + dy })
-      } else if (elementDrag.type === 'element') {
-        updateCanvasElement(elementDrag.id, { x: elementDrag.elementStartX + dx, y: elementDrag.elementStartY + dy })
+      setSelectedType(type)
+    } else {
+      if (!selectedIds.has(id)) {
+        setSelectedIds(new Set([id]))
+        setSelectedType(type)
       }
     }
     
-    const handleMouseUp = () => setElementDrag(null)
+    // Start drag
+    let positions = new Map<string, { x: number; y: number }>()
     
-    window.addEventListener('mousemove', handleMouseMove)
-    window.addEventListener('mouseup', handleMouseUp)
-    return () => {
-      window.removeEventListener('mousemove', handleMouseMove)
-      window.removeEventListener('mouseup', handleMouseUp)
+    if (type === 'element') {
+      selectedIds.forEach(selId => {
+        const el = canvasElements.find(e => e.id === selId)
+        if (el) positions.set(selId, { x: el.x, y: el.y })
+      })
+      if (!selectedIds.has(id)) {
+        const el = canvasElements.find(e => e.id === id)
+        if (el) positions.set(id, { x: el.x, y: el.y })
+      }
+    } else if (type === 'note') {
+      selectedIds.forEach(selId => {
+        const n = notes.find(n => n.id === selId)
+        if (n) positions.set(selId, { x: n.canvasX, y: n.canvasY })
+      })
+      if (!selectedIds.has(id)) {
+        const n = notes.find(n => n.id === id)
+        if (n) positions.set(id, { x: n.canvasX, y: n.canvasY })
+      }
     }
-  }, [elementDrag, viewport.zoom, updateNote, updateFolder, updateCanvasElement])
+    
+    setElementDrag({
+      ids: selectedIds.has(id) ? Array.from(selectedIds) : [id],
+      type,
+      startX: e.clientX,
+      startY: e.clientY,
+      startPositions: positions
+    })
+  }, [activeTool, connectStart, canvasElements, notes, selectedIds, createConnection])
+
+  // Handle resize/rotate
+  const handleResizeStart = useCallback((e: React.MouseEvent, id: string, handle: string) => {
+    e.stopPropagation()
+    const element = canvasElements.find(el => el.id === id)
+    if (!element || element.locked) return
+    
+    setResizing({
+      id,
+      handle,
+      startX: e.clientX,
+      startY: e.clientY,
+      startBounds: { x: element.x, y: element.y, width: element.width, height: element.height }
+    })
+  }, [canvasElements])
+
+  const handleRotateStart = useCallback((e: React.MouseEvent, id: string) => {
+    e.stopPropagation()
+    const element = canvasElements.find(el => el.id === id)
+    if (!element || element.locked) return
+    
+    const coords = getCanvasCoords(e)
+    const cx = element.x + element.width / 2
+    const cy = element.y + element.height / 2
+    const startAngle = Math.atan2(coords.y - cy, coords.x - cx)
+    
+    setRotating({
+      id,
+      startAngle,
+      startRotation: element.rotation || 0,
+      cx,
+      cy
+    })
+  }, [canvasElements, getCanvasCoords])
+
+  // Toggle lock
+  const toggleLock = useCallback((id: string) => {
+    const element = canvasElements.find(e => e.id === id)
+    if (element) {
+      updateCanvasElement(id, { locked: !element.locked })
+    }
+  }, [canvasElements, updateCanvasElement])
 
   // ═════════════════════════════════════════════════════════════════
   // KEYBOARD SHORTCUTS
@@ -615,34 +931,58 @@ export default function NeuralNotebook() {
       
       const key = e.key.toLowerCase()
       
-      if ((key === 'delete' || key === 'backspace') && selectedId) {
+      // Delete
+      if ((key === 'delete' || key === 'backspace') && selectedIds.size > 0) {
         e.preventDefault()
-        if (selectedType === 'note') deleteNote(selectedId)
-        else if (selectedType === 'folder') deleteFolder(selectedId)
-        else if (selectedType === 'element') deleteCanvasElement(selectedId)
-        else if (selectedType === 'connection') deleteConnection(selectedId)
+        deleteSelected()
       }
+      // Escape
       else if (key === 'escape') { 
-        setSelectedId(null)
+        setSelectedIds(new Set())
         setSelectedType(null)
         setEditingNote(null)
         setEditingElement(null)
         setConnectStart(null)
         setConnectEnd(null)
       }
+      // Undo/Redo
+      else if ((e.metaKey || e.ctrlKey) && key === 'z') {
+        e.preventDefault()
+        if (e.shiftKey) redo()
+        else undo()
+      }
+      else if ((e.metaKey || e.ctrlKey) && key === 'y') {
+        e.preventDefault()
+        redo()
+      }
+      // Copy/Paste/Duplicate
+      else if ((e.metaKey || e.ctrlKey) && key === 'c') {
+        e.preventDefault()
+        copySelected()
+      }
+      else if ((e.metaKey || e.ctrlKey) && key === 'v') {
+        e.preventDefault()
+        pasteClipboard()
+      }
+      else if ((e.metaKey || e.ctrlKey) && key === 'd') {
+        e.preventDefault()
+        duplicateSelected()
+      }
+      // Tools
       else if (key === 'v') setActiveTool('select')
       else if (key === 'h') setActiveTool('pan')
       else if (key === 'n') setActiveTool('note')
       else if (key === 'f') setActiveTool('folder')
-      else if (key === 'c') setActiveTool('canvas')
+      else if (key === 'c' && !e.metaKey && !e.ctrlKey) setActiveTool('canvas')
       else if (key === 's') setActiveTool('sticky')
       else if (key === 't') setActiveTool('text')
       else if (key === 'r') { setActiveTool('shape'); setShapeType('rectangle') }
       else if (key === 'o') { setActiveTool('shape'); setShapeType('circle') }
       else if (key === 'l') setActiveTool('line')
-      else if (key === 'a') setActiveTool('arrow')
+      else if (key === 'a' && !e.metaKey && !e.ctrlKey) setActiveTool('arrow')
       else if (key === 'b') setActiveTool('simblock')
       else if (key === 'k') setActiveTool('connect')
+      // Zoom
       else if (key === '+' || key === '=') setViewport(prev => ({ ...prev, zoom: prev.zoom * 1.2 }))
       else if (key === '-') setViewport(prev => ({ ...prev, zoom: prev.zoom / 1.2 }))
       else if (key === '0') setViewport({ x: 0, y: 0, zoom: 1 })
@@ -650,7 +990,7 @@ export default function NeuralNotebook() {
     
     window.addEventListener('keydown', handleKeyDown)
     return () => window.removeEventListener('keydown', handleKeyDown)
-  }, [selectedId, selectedType, deleteNote, deleteFolder, deleteCanvasElement, deleteConnection])
+  }, [selectedIds, selectedType, deleteSelected, undo, redo, copySelected, pasteClipboard, duplicateSelected])
 
   // ═════════════════════════════════════════════════════════════════
   // EXPORT / IMPORT
@@ -699,14 +1039,13 @@ export default function NeuralNotebook() {
       x: -note.canvasX * prev.zoom + 200,
       y: -note.canvasY * prev.zoom + 200
     }))
-    setSelectedId(note.id)
+    setSelectedIds(new Set([note.id]))
     setSelectedType('note')
     if (note.type === 'CANVAS') setEditingNote(note)
   }, [])
 
   const canvasNotes = notes.filter(n => n.type === 'CANVAS')
 
-  // Get element bounds for connections
   const getElementBounds = useCallback((id: string): { x: number; y: number; width: number; height: number } | null => {
     const element = canvasElements.find(e => e.id === id)
     if (element) return { x: element.x, y: element.y, width: element.width, height: element.height }
@@ -721,22 +1060,90 @@ export default function NeuralNotebook() {
   }, [canvasElements, notes, folders])
 
   // ═════════════════════════════════════════════════════════════════
-  // RENDER ELEMENT
+  // RENDER ELEMENT WITH HANDLES
   // ═════════════════════════════════════════════════════════════════
 
   const renderCanvasElement = useCallback((element: CanvasElement) => {
-    const isSelected = selectedId === element.id && selectedType === 'element'
+    const isSelected = selectedIds.has(element.id) && selectedType === 'element'
+    const showHandles = isSelected && activeTool === 'select' && !element.locked
+    
+    const rotation = element.rotation || 0
+    const cx = element.x + element.width / 2
+    const cy = element.y + element.height / 2
     
     const commonProps = {
-      className: `absolute cursor-move ${isSelected ? 'ring-2 ring-blue-500 ring-offset-2' : ''}`,
-      style: { left: element.x, top: element.y },
+      className: `absolute cursor-move ${isSelected ? 'ring-2 ring-blue-500' : ''} ${element.locked ? 'opacity-70' : ''}`,
+      style: { 
+        left: element.x, 
+        top: element.y,
+        transform: `rotate(${rotation}deg)`,
+        transformOrigin: 'center center'
+      },
       onMouseDown: (e: React.MouseEvent) => handleElementMouseDown(e, element.id, 'element'),
-      onDoubleClick: () => setEditingElement(element)
+      onDoubleClick: () => !element.locked && setEditingElement(element)
     }
 
-    // Show connection anchors when in connect mode
-    const showAnchors = activeTool === 'connect'
-    const anchors = ['top', 'right', 'bottom', 'left'] as const
+    // Port rendering for SimBlocks
+    const renderPorts = () => {
+      if (element.type !== 'simblock' || !element.ports) return null
+      
+      return element.ports.map(port => (
+        <div
+          key={port.id}
+          className={`absolute w-4 h-4 rounded-full cursor-crosshair transform -translate-x-1/2 -translate-y-1/2 transition-all ${
+            port.type === 'input' ? 'bg-green-500 border-2 border-green-300' : 'bg-orange-500 border-2 border-orange-300'
+          } hover:scale-125 z-10`}
+          style={{ left: port.x, top: port.y }}
+          onMouseDown={(e) => handleElementMouseDown(e, element.id, 'element', port.id)}
+          title={port.type === 'input' ? 'Input Port' : 'Output Port'}
+        >
+          <div className="absolute inset-0 rounded-full bg-white opacity-50 animate-ping" />
+        </div>
+      ))
+    }
+
+    // Resize handles
+    const renderHandles = () => {
+      if (!showHandles) return null
+      
+      const handles = [
+        { pos: 'nw', x: 0, y: 0, cursor: 'nwse-resize' },
+        { pos: 'ne', x: element.width, y: 0, cursor: 'nesw-resize' },
+        { pos: 'sw', x: 0, y: element.height, cursor: 'nesw-resize' },
+        { pos: 'se', x: element.width, y: element.height, cursor: 'nwse-resize' },
+      ]
+      
+      return (
+        <>
+          {/* Resize handles */}
+          {handles.map(h => (
+            <div
+              key={h.pos}
+              className="absolute w-2.5 h-2.5 bg-white border-2 border-blue-500 rounded-sm cursor-pointer hover:bg-blue-100"
+              style={{ left: h.x - HANDLE_SIZE/2, top: h.y - HANDLE_SIZE/2, cursor: h.cursor }}
+              onMouseDown={(e) => handleResizeStart(e, element.id, h.pos)}
+            />
+          ))}
+          
+          {/* Rotate handle */}
+          <div
+            className="absolute w-4 h-4 bg-blue-500 rounded-full cursor-pointer hover:bg-blue-400"
+            style={{ 
+              left: element.width / 2 - 8, 
+              top: -ROTATE_HANDLE_OFFSET - 8,
+              cursor: 'grab'
+            }}
+            onMouseDown={(e) => handleRotateStart(e, element.id)}
+          >
+            <RotateCcw className="w-3 h-3 text-white m-0.5" />
+          </div>
+          <div 
+            className="absolute w-px h-5 bg-blue-500"
+            style={{ left: element.width / 2, top: -ROTATE_HANDLE_OFFSET + 8 }}
+          />
+        </>
+      )
+    }
 
     if (element.type === 'shape') {
       const shapeContent = element.shapeType === 'circle' ? (
@@ -782,20 +1189,15 @@ export default function NeuralNotebook() {
       return (
         <div key={element.id} {...commonProps}>
           {shapeContent}
-          {showAnchors && anchors.map(anchor => {
-            const pos = getAnchorPosition(element, anchor)
-            return (
-              <div key={anchor}
-                className="absolute w-3 h-3 bg-blue-500 rounded-full cursor-crosshair transform -translate-x-1/2 -translate-y-1/2 hover:scale-150 transition-transform"
-                style={{ left: pos.x - element.x, top: pos.y - element.y }}
-              />
-            )
-          })}
-          {isSelected && (
+          {renderHandles()}
+          {isSelected && !element.locked && (
             <Button size="icon" variant="ghost" className="absolute -top-2 -right-2 h-5 w-5 bg-red-500 text-white rounded-full"
-              onClick={(e) => { e.stopPropagation(); deleteCanvasElement(element.id) }}>
+              onClick={(e) => { e.stopPropagation(); deleteSelected() }}>
               <X className="h-3 w-3" />
             </Button>
+          )}
+          {element.locked && (
+            <Lock className="absolute top-1 left-1 h-4 w-4 text-zinc-400" />
           )}
         </div>
       )
@@ -804,14 +1206,13 @@ export default function NeuralNotebook() {
     if (element.type === 'line' || element.type === 'arrow') {
       const dx = (element.endX || element.x) - element.x
       const dy = (element.endY || element.y) - element.y
-      const length = Math.sqrt(dx * dx + dy * dy)
       
       return (
         <div key={element.id} 
           className={`absolute cursor-move ${isSelected ? 'ring-2 ring-blue-500' : ''}`}
           style={{ left: element.x, top: element.y }}
           onMouseDown={(e) => handleElementMouseDown(e, element.id, 'element')}>
-          <svg width={Math.max(Math.abs(dx) + 20, 50)} height={Math.abs(dy) + 20} style={{ overflow: 'visible' }}>
+          <svg width={Math.abs(dx) + 20} height={Math.abs(dy) + 20} style={{ overflow: 'visible' }}>
             <line
               x1={0}
               y1={0}
@@ -831,7 +1232,7 @@ export default function NeuralNotebook() {
           </svg>
           {isSelected && (
             <Button size="icon" variant="ghost" className="absolute -top-2 -right-2 h-5 w-5 bg-red-500 text-white rounded-full"
-              onClick={(e) => { e.stopPropagation(); deleteCanvasElement(element.id) }}>
+              onClick={(e) => { e.stopPropagation(); deleteSelected() }}>
               <X className="h-3 w-3" />
             </Button>
           )}
@@ -848,9 +1249,10 @@ export default function NeuralNotebook() {
           >
             {element.text || 'Text'}
           </div>
-          {isSelected && (
+          {renderHandles()}
+          {isSelected && !element.locked && (
             <Button size="icon" variant="ghost" className="absolute -top-2 -right-2 h-5 w-5 bg-red-500 text-white rounded-full"
-              onClick={(e) => { e.stopPropagation(); deleteCanvasElement(element.id) }}>
+              onClick={(e) => { e.stopPropagation(); deleteSelected() }}>
               <X className="h-3 w-3" />
             </Button>
           )}
@@ -870,32 +1272,32 @@ export default function NeuralNotebook() {
             <div className="px-2 py-1 text-xs font-bold flex items-center gap-1" style={{ backgroundColor: blockInfo.color }}>
               <span>{blockInfo.icon}</span>
               <span className="text-white">{blockInfo.label}</span>
+              {element.locked && <Lock className="h-3 w-3 ml-auto text-white/70" />}
             </div>
             <div className="flex-1 p-2 text-xs font-mono bg-zinc-900 text-zinc-300 overflow-hidden">
               {element.code || '// code'}
             </div>
           </Card>
-          {showAnchors && anchors.map(anchor => {
-            const pos = getAnchorPosition(element, anchor)
-            return (
-              <div key={anchor}
-                className="absolute w-3 h-3 bg-blue-500 rounded-full cursor-crosshair transform -translate-x-1/2 -translate-y-1/2 hover:scale-150 transition-transform z-10"
-                style={{ left: pos.x - element.x, top: pos.y - element.y }}
-              />
-            )
-          })}
-          {isSelected && (
-            <Button size="icon" variant="ghost" className="absolute -top-2 -right-2 h-5 w-5 bg-red-500 text-white rounded-full"
-              onClick={(e) => { e.stopPropagation(); deleteCanvasElement(element.id) }}>
-              <X className="h-3 w-3" />
-            </Button>
+          {renderPorts()}
+          {renderHandles()}
+          {isSelected && !element.locked && (
+            <>
+              <Button size="icon" variant="ghost" className="absolute -top-2 -right-2 h-5 w-5 bg-red-500 text-white rounded-full"
+                onClick={(e) => { e.stopPropagation(); deleteSelected() }}>
+                <X className="h-3 w-3" />
+              </Button>
+              <Button size="icon" variant="ghost" className="absolute -top-2 -right-8 h-5 w-5 bg-zinc-600 text-white rounded-full"
+                onClick={(e) => { e.stopPropagation(); toggleLock(element.id) }}>
+                {element.locked ? <Lock className="h-3 w-3" /> : <Unlock className="h-3 w-3" />}
+              </Button>
+            </>
           )}
         </div>
       )
     }
     
     return null
-  }, [selectedId, selectedType, handleElementMouseDown, deleteCanvasElement, activeTool])
+  }, [selectedIds, selectedType, handleElementMouseDown, handleResizeStart, handleRotateStart, activeTool, deleteSelected, toggleLock])
 
   // ═════════════════════════════════════════════════════════════════
   // RENDER CONNECTIONS
@@ -911,7 +1313,6 @@ export default function NeuralNotebook() {
       const from = getAnchorPosition(fromBounds, conn.fromAnchor)
       const to = getAnchorPosition(toBounds, conn.toAnchor)
       
-      // Calculate control points for bezier curve
       const dx = to.x - from.x
       const dy = to.y - from.y
       const dist = Math.sqrt(dx * dx + dy * dy)
@@ -920,30 +1321,21 @@ export default function NeuralNotebook() {
       let cp1x = from.x, cp1y = from.y
       let cp2x = to.x, cp2y = to.y
       
-      if (conn.fromAnchor === 'right') { cp1x += offset }
-      else if (conn.fromAnchor === 'left') { cp1x -= offset }
-      else if (conn.fromAnchor === 'bottom') { cp1y += offset }
-      else if (conn.fromAnchor === 'top') { cp1y -= offset }
+      if (conn.fromAnchor === 'right') cp1x += offset
+      else if (conn.fromAnchor === 'left') cp1x -= offset
+      else if (conn.fromAnchor === 'bottom') cp1y += offset
+      else if (conn.fromAnchor === 'top') cp1y -= offset
       
-      if (conn.toAnchor === 'right') { cp2x += offset }
-      else if (conn.toAnchor === 'left') { cp2x -= offset }
-      else if (conn.toAnchor === 'bottom') { cp2y += offset }
-      else if (conn.toAnchor === 'top') { cp2y -= offset }
+      if (conn.toAnchor === 'right') cp2x += offset
+      else if (conn.toAnchor === 'left') cp2x -= offset
+      else if (conn.toAnchor === 'bottom') cp2y += offset
+      else if (conn.toAnchor === 'top') cp2y -= offset
       
-      const isSelected = selectedId === conn.id && selectedType === 'connection'
+      const isSelected = selectedIds.has(conn.id)
       
       return (
-        <g key={conn.id} 
-          className="cursor-pointer"
-          onClick={() => { setSelectedId(conn.id); setSelectedType('connection') }}>
-          {/* Invisible wider path for easier clicking */}
-          <path
-            d={`M ${from.x} ${from.y} C ${cp1x} ${cp1y}, ${cp2x} ${cp2y}, ${to.x} ${to.y}`}
-            fill="none"
-            stroke="transparent"
-            strokeWidth={20}
-          />
-          {/* Visible path */}
+        <g key={conn.id} className="cursor-pointer" onClick={() => { setSelectedIds(new Set([conn.id])); setSelectedType('connection') }}>
+          <path d={`M ${from.x} ${from.y} C ${cp1x} ${cp1y}, ${cp2x} ${cp2y}, ${to.x} ${to.y}`} fill="none" stroke="transparent" strokeWidth={20} />
           <path
             d={`M ${from.x} ${from.y} C ${cp1x} ${cp1y}, ${cp2x} ${cp2y}, ${to.x} ${to.y}`}
             fill="none"
@@ -952,19 +1344,15 @@ export default function NeuralNotebook() {
             strokeDasharray={conn.animated ? '5,5' : undefined}
             markerEnd="url(#conn-arrow)"
           />
-          {/* Arrow marker */}
           <defs>
             <marker id="conn-arrow" markerWidth="10" markerHeight="7" refX="9" refY="3.5" orient="auto">
               <polygon points="0 0, 10 3.5, 0 7" fill={isSelected ? '#3b82f6' : conn.color} />
             </marker>
           </defs>
-          {isSelected && (
-            <circle cx={from.x} cy={from.y} r={5} fill="#3b82f6" />
-          )}
         </g>
       )
     })
-  }, [connections, selectedId, selectedType, getElementBounds])
+  }, [connections, selectedIds, getElementBounds])
 
   // ═════════════════════════════════════════════════════════════════
   // RENDER
@@ -988,45 +1376,48 @@ export default function NeuralNotebook() {
           </h1>
           <Separator orientation="vertical" className="h-6" />
           
+          {/* Undo/Redo */}
+          <div className="flex items-center gap-1">
+            <Button size="icon" variant="ghost" onClick={undo} disabled={historyIndex <= 0} title="Undo (Ctrl+Z)">
+              <Undo2 className="h-4 w-4" />
+            </Button>
+            <Button size="icon" variant="ghost" onClick={redo} disabled={historyIndex >= history.length - 1} title="Redo (Ctrl+Y)">
+              <Redo2 className="h-4 w-4" />
+            </Button>
+          </div>
+          
+          <Separator orientation="vertical" className="h-6" />
+          
           {/* Tools */}
           <div className="flex items-center gap-1">
-            <Button size="icon" variant={activeTool === 'select' ? 'default' : 'ghost'} 
-              onClick={() => setActiveTool('select')} className="h-8 w-8" title="Select (V)">
+            <Button size="icon" variant={activeTool === 'select' ? 'default' : 'ghost'} onClick={() => setActiveTool('select')} title="Select (V)">
               <MousePointer className="h-4 w-4" />
             </Button>
-            <Button size="icon" variant={activeTool === 'pan' ? 'default' : 'ghost'} 
-              onClick={() => setActiveTool('pan')} className="h-8 w-8" title="Pan (H)">
+            <Button size="icon" variant={activeTool === 'pan' ? 'default' : 'ghost'} onClick={() => setActiveTool('pan')} title="Pan (H)">
               <Hand className="h-4 w-4" />
             </Button>
             
             <Separator orientation="vertical" className="h-6 mx-1" />
             
-            <Button size="icon" variant={activeTool === 'note' ? 'default' : 'ghost'} 
-              onClick={() => setActiveTool('note')} className="h-8 w-8" title="Note (N)">
+            <Button size="icon" variant={activeTool === 'note' ? 'default' : 'ghost'} onClick={() => setActiveTool('note')} title="Note (N)">
               <FileText className="h-4 w-4" />
             </Button>
-            <Button size="icon" variant={activeTool === 'folder' ? 'default' : 'ghost'} 
-              onClick={() => setActiveTool('folder')} className="h-8 w-8" title="Folder (F)">
+            <Button size="icon" variant={activeTool === 'folder' ? 'default' : 'ghost'} onClick={() => setActiveTool('folder')} title="Folder (F)">
               <FolderPlus className="h-4 w-4" />
             </Button>
-            <Button size="icon" variant={activeTool === 'canvas' ? 'default' : 'ghost'} 
-              onClick={() => setActiveTool('canvas')} className="h-8 w-8" title="Canvas (C)">
+            <Button size="icon" variant={activeTool === 'canvas' ? 'default' : 'ghost'} onClick={() => setActiveTool('canvas')} title="Canvas (C)">
               <Palette className="h-4 w-4" />
             </Button>
             
             <Separator orientation="vertical" className="h-6 mx-1" />
             
-            <Button size="icon" variant={activeTool === 'text' ? 'default' : 'ghost'} 
-              onClick={() => setActiveTool('text')} className="h-8 w-8" title="Text (T)">
+            <Button size="icon" variant={activeTool === 'text' ? 'default' : 'ghost'} onClick={() => setActiveTool('text')} title="Text (T)">
               <Type className="h-4 w-4" />
             </Button>
             
             <div className="relative">
-              <Button size="icon" variant={activeTool === 'shape' ? 'default' : 'ghost'} 
-                onClick={() => setActiveTool('shape')} className="h-8 w-8" title="Shape (R/O)">
-                {shapeType === 'circle' ? <Circle className="h-4 w-4" /> : 
-                 shapeType === 'triangle' ? <Triangle className="h-4 w-4" /> : 
-                 <Square className="h-4 w-4" />}
+              <Button size="icon" variant={activeTool === 'shape' ? 'default' : 'ghost'} onClick={() => setActiveTool('shape')} title="Shape (R/O)">
+                {shapeType === 'circle' ? <Circle className="h-4 w-4" /> : <Square className="h-4 w-4" />}
               </Button>
               {activeTool === 'shape' && (
                 <div className={`absolute top-10 left-0 z-50 flex gap-1 p-1 rounded-md shadow-lg ${theme === 'dark' ? 'bg-zinc-800' : 'bg-white border'}`}>
@@ -1035,8 +1426,7 @@ export default function NeuralNotebook() {
                     { type: 'circle' as const, icon: Circle },
                     { type: 'triangle' as const, icon: Triangle },
                   ].map(({ type, icon: Icon }) => (
-                    <Button key={type} size="icon" variant={shapeType === type ? 'default' : 'ghost'} 
-                      onClick={() => setShapeType(type)} className="h-7 w-7">
+                    <Button key={type} size="icon" variant={shapeType === type ? 'default' : 'ghost'} onClick={() => setShapeType(type)} className="h-7 w-7">
                       <Icon className="h-3 w-3" />
                     </Button>
                   ))}
@@ -1044,32 +1434,25 @@ export default function NeuralNotebook() {
               )}
             </div>
             
-            <Button size="icon" variant={activeTool === 'line' ? 'default' : 'ghost'} 
-              onClick={() => setActiveTool('line')} className="h-8 w-8" title="Line (L)">
+            <Button size="icon" variant={activeTool === 'line' ? 'default' : 'ghost'} onClick={() => setActiveTool('line')} title="Line (L)">
               <Minus className="h-4 w-4" />
             </Button>
-            <Button size="icon" variant={activeTool === 'arrow' ? 'default' : 'ghost'} 
-              onClick={() => setActiveTool('arrow')} className="h-8 w-8" title="Arrow (A)">
+            <Button size="icon" variant={activeTool === 'arrow' ? 'default' : 'ghost'} onClick={() => setActiveTool('arrow')} title="Arrow (A)">
               <Minus className="h-4 w-4 rotate-45" />
             </Button>
             
             <Separator orientation="vertical" className="h-6 mx-1" />
             
-            {/* Connect Tool */}
-            <Button size="icon" variant={activeTool === 'connect' ? 'default' : 'ghost'} 
-              onClick={() => setActiveTool('connect')} className="h-8 w-8" title="Connect (K)">
+            <Button size="icon" variant={activeTool === 'connect' ? 'default' : 'ghost'} onClick={() => setActiveTool('connect')} title="Connect (K)">
               <Link2 className="h-4 w-4" />
             </Button>
-            
-            {/* SimBlock */}
-            <Button size="icon" variant={activeTool === 'simblock' ? 'default' : 'ghost'} 
-              onClick={() => setActiveTool('simblock')} className="h-8 w-8" title="Sim Block (B)">
+            <Button size="icon" variant={activeTool === 'simblock' ? 'default' : 'ghost'} onClick={() => setActiveTool('simblock')} title="Sim Block (B)">
               <Code2 className="h-4 w-4" />
             </Button>
           </div>
           
           {/* Color Picker */}
-          {(activeTool === 'shape' || activeTool === 'line' || activeTool === 'arrow' || activeTool === 'text' || activeTool === 'connect') && (
+          {(activeTool === 'shape' || activeTool === 'line' || activeTool === 'arrow' || activeTool === 'text') && (
             <div className="flex items-center gap-1 ml-2">
               {SHAPE_COLORS.slice(0, 6).map(color => (
                 <button key={color} 
@@ -1097,10 +1480,19 @@ export default function NeuralNotebook() {
 
         {/* Right */}
         <div className="flex items-center gap-3">
+          {/* Clipboard */}
+          <Button size="icon" variant="ghost" onClick={copySelected} disabled={selectedIds.size === 0} title="Copy (Ctrl+C)">
+            <Copy className="h-4 w-4" />
+          </Button>
+          <Button size="icon" variant="ghost" onClick={pasteClipboard} disabled={!clipboard} title="Paste (Ctrl+V)">
+            <Clipboard className="h-4 w-4" />
+          </Button>
+          
+          <Separator orientation="vertical" className="h-6" />
+          
           <div className={`flex items-center gap-1 rounded-md p-1 ${theme === 'dark' ? 'bg-zinc-800' : 'bg-zinc-200'}`}>
             {(['dots', 'lines', 'none'] as GridType[]).map(g => (
-              <Button key={g} size="icon" variant={gridType === g ? 'secondary' : 'ghost'} 
-                onClick={() => setGridType(g)} className="h-6 w-6">
+              <Button key={g} size="icon" variant={gridType === g ? 'secondary' : 'ghost'} onClick={() => setGridType(g)} className="h-6 w-6">
                 {g === 'dots' ? <Circle className="h-3 w-3" /> : g === 'lines' ? <Grid3X3 className="h-3 w-3" /> : <X className="h-3 w-3" />}
               </Button>
             ))}
@@ -1129,76 +1521,21 @@ export default function NeuralNotebook() {
         {/* Sidebar */}
         {showSidebar && (
           <div className={`absolute left-0 top-0 bottom-0 w-64 z-20 flex flex-col ${theme === 'dark' ? 'bg-zinc-900/95 border-zinc-800' : 'bg-white/95 border-zinc-200'} border-r`}>
-            <Tabs defaultValue="canvas" className="flex-1 flex flex-col">
+            <Tabs defaultValue="elements" className="flex-1 flex flex-col">
               <div className="px-3 pt-3 pb-2 flex items-center justify-between">
                 <TabsList className={theme === 'dark' ? 'bg-zinc-800' : 'bg-zinc-200'}>
-                  <TabsTrigger value="canvas" className="text-xs">🎨 Canvas</TabsTrigger>
                   <TabsTrigger value="elements" className="text-xs">📐 Elements</TabsTrigger>
+                  <TabsTrigger value="canvas" className="text-xs">🎨 Canvas</TabsTrigger>
                 </TabsList>
                 <Button size="icon" variant="ghost" className="h-6 w-6" onClick={() => setShowSidebar(false)}>
                   <X className="h-4 w-4" />
                 </Button>
               </div>
               
-              <TabsContent value="canvas" className="flex-1 mt-0 overflow-hidden">
-                <ScrollArea className="h-full px-3">
-                  <div className="py-2">
-                    <Button className="w-full mb-4" onClick={() => createNote(
-                      (-viewport.x + 400) / viewport.zoom,
-                      (-viewport.y + 300) / viewport.zoom,
-                      'CANVAS'
-                    )}>
-                      <Plus className="h-4 w-4 mr-2" /> Neue Canvas
-                    </Button>
-                    
-                    <div className="space-y-1">
-                      <div className="text-xs text-zinc-500 mb-2 px-2">Canvas ({canvasNotes.length})</div>
-                      {canvasNotes.map(note => (
-                        <div key={note.id} 
-                          className={`flex items-center gap-2 p-3 rounded-md cursor-pointer transition-colors ${
-                            selectedId === note.id ? 'bg-blue-600 text-white' : theme === 'dark' ? 'hover:bg-zinc-800' : 'hover:bg-zinc-100'
-                          }`}
-                          onClick={() => openNote(note)}>
-                          <Palette className="h-5 w-5 text-blue-400" />
-                          <div className="flex-1 min-w-0">
-                            <div className="font-medium truncate text-sm">{note.title}</div>
-                          </div>
-                          <Button size="icon" variant="ghost" className={`h-6 w-6 ${selectedId === note.id ? 'text-white' : ''}`}
-                            onClick={(e) => { e.stopPropagation(); deleteNote(note.id) }}>
-                            <Trash2 className="h-3 w-3" />
-                          </Button>
-                        </div>
-                      ))}
-                    </div>
-                    
-                    {/* Connections */}
-                    {connections.length > 0 && (
-                      <div className="mt-4">
-                        <div className="text-xs text-zinc-500 mb-2 px-2">Connections ({connections.length})</div>
-                        {connections.map(conn => (
-                          <div key={conn.id}
-                            className={`flex items-center gap-2 p-2 rounded-md cursor-pointer ${
-                              selectedId === conn.id ? 'bg-blue-600 text-white' : theme === 'dark' ? 'hover:bg-zinc-800' : 'hover:bg-zinc-100'
-                            }`}
-                            onClick={() => { setSelectedId(conn.id); setSelectedType('connection') }}>
-                            <Link2 className="h-4 w-4" />
-                            <span className="text-xs truncate flex-1">{conn.fromId.slice(0, 8)} → {conn.toId.slice(0, 8)}</span>
-                            <Button size="icon" variant="ghost" className="h-5 w-5"
-                              onClick={(e) => { e.stopPropagation(); deleteConnection(conn.id) }}>
-                              <X className="h-3 w-3" />
-                            </Button>
-                          </div>
-                        ))}
-                      </div>
-                    )}
-                  </div>
-                </ScrollArea>
-              </TabsContent>
-              
               <TabsContent value="elements" className="flex-1 mt-0 overflow-hidden">
                 <ScrollArea className="h-full px-3">
                   <div className="py-2 space-y-2">
-                    <div className="text-xs text-zinc-500 px-2">Canvas Elements ({canvasElements.length})</div>
+                    <div className="text-xs text-zinc-500 px-2">Quick Add SimBlocks</div>
                     
                     <div className="grid grid-cols-2 gap-2 mb-4">
                       {SIM_BLOCK_TYPES.map(bt => (
@@ -1222,12 +1559,39 @@ export default function NeuralNotebook() {
                       ))}
                     </div>
                     
+                    <div className="text-xs text-zinc-500 px-2">Selected ({selectedIds.size})</div>
+                    
+                    {selectedIds.size > 0 && (
+                      <div className="flex gap-2 mb-2">
+                        <Button size="sm" variant="outline" onClick={duplicateSelected}>
+                          <Copy className="h-3 w-3 mr-1" /> Duplicate
+                        </Button>
+                        <Button size="sm" variant="destructive" onClick={deleteSelected}>
+                          <Trash2 className="h-3 w-3 mr-1" /> Delete
+                        </Button>
+                      </div>
+                    )}
+                    
+                    <div className="text-xs text-zinc-500 px-2">Canvas Elements ({canvasElements.length})</div>
+                    
                     {canvasElements.map(element => (
                       <div key={element.id} 
                         className={`flex items-center gap-2 p-2 rounded-md cursor-pointer ${
-                          selectedId === element.id ? 'bg-blue-600 text-white' : theme === 'dark' ? 'hover:bg-zinc-800' : 'hover:bg-zinc-100'
+                          selectedIds.has(element.id) ? 'bg-blue-600 text-white' : theme === 'dark' ? 'hover:bg-zinc-800' : 'hover:bg-zinc-100'
                         }`}
-                        onClick={() => { setSelectedId(element.id); setSelectedType('element') }}
+                        onClick={(e) => {
+                          if (e.shiftKey) {
+                            setSelectedIds(prev => {
+                              const next = new Set(prev)
+                              if (next.has(element.id)) next.delete(element.id)
+                              else next.add(element.id)
+                              return next
+                            })
+                          } else {
+                            setSelectedIds(new Set([element.id]))
+                          }
+                          setSelectedType('element')
+                        }}
                         onDoubleClick={() => setEditingElement(element)}>
                         <span className="text-lg">
                           {element.type === 'shape' ? '🔷' : 
@@ -1239,12 +1603,43 @@ export default function NeuralNotebook() {
                         <span className="text-sm truncate flex-1">
                           {element.type === 'simblock' ? element.blockType : element.type}
                         </span>
-                        <Button size="icon" variant="ghost" className="h-5 w-5"
-                          onClick={(e) => { e.stopPropagation(); deleteCanvasElement(element.id) }}>
-                          <X className="h-3 w-3" />
-                        </Button>
+                        {element.locked && <Lock className="h-3 w-3 opacity-60" />}
                       </div>
                     ))}
+                  </div>
+                </ScrollArea>
+              </TabsContent>
+              
+              <TabsContent value="canvas" className="flex-1 mt-0 overflow-hidden">
+                <ScrollArea className="h-full px-3">
+                  <div className="py-2">
+                    <Button className="w-full mb-4" onClick={() => createNote(
+                      (-viewport.x + 400) / viewport.zoom,
+                      (-viewport.y + 300) / viewport.zoom,
+                      'CANVAS'
+                    )}>
+                      <Plus className="h-4 w-4 mr-2" /> Neue Canvas
+                    </Button>
+                    
+                    <div className="space-y-1">
+                      <div className="text-xs text-zinc-500 mb-2 px-2">Canvas ({canvasNotes.length})</div>
+                      {canvasNotes.map(note => (
+                        <div key={note.id} 
+                          className={`flex items-center gap-2 p-3 rounded-md cursor-pointer transition-colors ${
+                            selectedIds.has(note.id) ? 'bg-blue-600 text-white' : theme === 'dark' ? 'hover:bg-zinc-800' : 'hover:bg-zinc-100'
+                          }`}
+                          onClick={() => openNote(note)}>
+                          <Palette className="h-5 w-5 text-blue-400" />
+                          <div className="flex-1 min-w-0">
+                            <div className="font-medium truncate text-sm">{note.title}</div>
+                          </div>
+                          <Button size="icon" variant="ghost" className={`h-6 w-6 ${selectedIds.has(note.id) ? 'text-white' : ''}`}
+                            onClick={(e) => { e.stopPropagation(); setNotes(prev => prev.filter(n => n.id !== note.id)) }}>
+                            <Trash2 className="h-3 w-3" />
+                          </Button>
+                        </div>
+                      ))}
+                    </div>
                   </div>
                 </ScrollArea>
               </TabsContent>
@@ -1283,20 +1678,23 @@ export default function NeuralNotebook() {
             {/* Connections SVG Layer */}
             <svg className="absolute inset-0 w-full h-full pointer-events-none" style={{ overflow: 'visible' }}>
               {renderConnections()}
-              
-              {/* Temp connection while connecting */}
               {connectStart && connectEnd && (
-                <line
-                  x1={connectStart.x}
-                  y1={connectStart.y}
-                  x2={connectEnd.x}
-                  y2={connectEnd.y}
-                  stroke="#3b82f6"
-                  strokeWidth={2}
-                  strokeDasharray="5,5"
-                />
+                <line x1={getElementBounds(connectStart.id)?.x || 0} y1={getElementBounds(connectStart.id)?.y || 0} x2={connectEnd.x} y2={connectEnd.y} stroke="#3b82f6" strokeWidth={2} strokeDasharray="5,5" />
               )}
             </svg>
+            
+            {/* Selection Box */}
+            {selectionBox && (
+              <div
+                className="absolute border-2 border-blue-500 bg-blue-500/10 pointer-events-none"
+                style={{
+                  left: Math.min(selectionBox.startX, selectionBox.endX),
+                  top: Math.min(selectionBox.startY, selectionBox.endY),
+                  width: Math.abs(selectionBox.endX - selectionBox.startX),
+                  height: Math.abs(selectionBox.endY - selectionBox.startY)
+                }}
+              />
+            )}
             
             {/* Canvas Elements */}
             {canvasElements.map(renderCanvasElement)}
@@ -1311,7 +1709,7 @@ export default function NeuralNotebook() {
             {/* Folders */}
             {folders.map(folder => (
               <div key={folder.id} 
-                className={`absolute cursor-move ${selectedId === folder.id ? 'ring-2 ring-blue-500' : ''}`}
+                className={`absolute cursor-move ${selectedIds.has(folder.id) ? 'ring-2 ring-blue-500' : ''}`}
                 style={{ left: folder.canvasX, top: folder.canvasY, width: folder.canvasWidth, height: folder.canvasHeight }}
                 onMouseDown={(e) => handleElementMouseDown(e, folder.id, 'folder')}>
                 <Card className={`w-full h-full overflow-hidden flex flex-col ${theme === 'dark' ? 'bg-zinc-900/90 border-zinc-700' : 'bg-white/90 border-zinc-300'}`}
@@ -1323,7 +1721,7 @@ export default function NeuralNotebook() {
                         <span className="text-sm font-medium truncate">{folder.name}</span>
                       </div>
                       <Button size="icon" variant="ghost" className="h-6 w-6 opacity-60 hover:opacity-100"
-                        onClick={(e) => { e.stopPropagation(); deleteFolder(folder.id) }}>
+                        onClick={(e) => { e.stopPropagation(); setFolders(prev => prev.filter(f => f.id !== folder.id)) }}>
                         <Trash2 className="h-3 w-3" />
                       </Button>
                     </div>
@@ -1335,7 +1733,7 @@ export default function NeuralNotebook() {
             {/* Notes */}
             {notes.map(note => (
               <div key={note.id} 
-                className={`absolute cursor-move ${selectedId === note.id ? 'ring-2 ring-green-500' : ''}`}
+                className={`absolute cursor-move ${selectedIds.has(note.id) ? 'ring-2 ring-green-500' : ''}`}
                 style={{ left: note.canvasX, top: note.canvasY, width: note.canvasWidth, height: note.canvasHeight }}
                 onMouseDown={(e) => handleElementMouseDown(e, note.id, 'note')}
                 onDoubleClick={() => note.type === 'CANVAS' ? openNote(note) : setEditingNote(note)}>
@@ -1345,7 +1743,7 @@ export default function NeuralNotebook() {
                     <div className="flex items-center justify-between mb-2">
                       <span className="font-medium text-sm text-zinc-800 truncate">{note.title}</span>
                       <Button size="icon" variant="ghost" className="h-5 w-5 opacity-60 hover:opacity-100"
-                        onClick={(e) => { e.stopPropagation(); deleteNote(note.id) }}>
+                        onClick={(e) => { e.stopPropagation(); setNotes(prev => prev.filter(n => n.id !== note.id)) }}>
                         <X className="h-3 w-3 text-zinc-600" />
                       </Button>
                     </div>
@@ -1360,7 +1758,7 @@ export default function NeuralNotebook() {
                           <span className="font-medium truncate text-sm">{note.title}</span>
                         </div>
                         <Button size="icon" variant="ghost" className="h-6 w-6 opacity-60 hover:opacity-100"
-                          onClick={(e) => { e.stopPropagation(); deleteNote(note.id) }}>
+                          onClick={(e) => { e.stopPropagation(); setNotes(prev => prev.filter(n => n.id !== note.id)) }}>
                           <Trash2 className="h-3 w-3" />
                         </Button>
                       </div>
@@ -1378,7 +1776,7 @@ export default function NeuralNotebook() {
                       <div className="flex items-center justify-between">
                         <span className="font-medium truncate">{note.title}</span>
                         <Button size="icon" variant="ghost" className="h-6 w-6 opacity-60 hover:opacity-100"
-                          onClick={(e) => { e.stopPropagation(); deleteNote(note.id) }}>
+                          onClick={(e) => { e.stopPropagation(); setNotes(prev => prev.filter(n => n.id !== note.id)) }}>
                           <Trash2 className="h-3 w-3" />
                         </Button>
                       </div>
@@ -1405,7 +1803,7 @@ export default function NeuralNotebook() {
         {/* Connect Mode Indicator */}
         {activeTool === 'connect' && (
           <div className={`absolute bottom-16 left-1/2 transform -translate-x-1/2 px-4 py-2 rounded-full ${theme === 'dark' ? 'bg-blue-600' : 'bg-blue-500'} text-white text-sm`}>
-            {connectStart ? 'Klicke auf ein anderes Element zum Verbinden' : 'Klicke auf ein Element um Verbindung zu starten'}
+            {connectStart ? '🔴 Click another element or port to connect' : '🔵 Click an element or port to start connection'}
           </div>
         )}
       </div>
@@ -1416,112 +1814,79 @@ export default function NeuralNotebook() {
           <span>Position: {Math.round(-viewport.x / viewport.zoom)}, {Math.round(-viewport.y / viewport.zoom)}</span>
           <span>|</span>
           <span>{notes.length} Notes, {folders.length} Folders, {canvasElements.length} Elements, {connections.length} Connections</span>
+          <span>|</span>
+          <span>Selected: {selectedIds.size}</span>
         </div>
         <div className="flex items-center gap-2">
           <span className="text-zinc-400">Tool: {activeTool}</span>
+          <span className="text-zinc-400">|</span>
+          <span className="text-zinc-400">History: {historyIndex + 1}/{history.length}</span>
         </div>
       </footer>
 
-      {/* CANVAS EDITOR DIALOG */}
+      {/* DIALOGS */}
       <Dialog open={!!editingNote && editingNote?.type === 'CANVAS'} onOpenChange={() => setEditingNote(null)}>
         <DialogContent className="max-w-[95vw] w-[95vw] h-[90vh] flex flex-col">
           <DialogHeader>
-            <DialogTitle className="flex items-center gap-2">
-              <Palette className="h-4 w-4" />
-              Canvas: {editingNote?.title}
-            </DialogTitle>
+            <DialogTitle className="flex items-center gap-2"><Palette className="h-4 w-4" /> Canvas: {editingNote?.title}</DialogTitle>
           </DialogHeader>
           {editingNote && editingNote.type === 'CANVAS' && (
             <div className="flex-1 flex flex-col overflow-hidden">
-              <Input value={editingNote.title} 
-                onChange={(e) => setEditingNote({ ...editingNote, title: e.target.value })}
-                placeholder="Canvas Name..." className="mb-4" />
+              <Input value={editingNote.title} onChange={(e) => setEditingNote({ ...editingNote, title: e.target.value })} className="mb-4" />
               <div className="flex-1 border rounded-md overflow-hidden bg-white">
-                <TldrawCanvas initialData={editingNote.content} 
-                  onChange={(data) => setEditingNote({ ...editingNote, content: data })} />
+                <TldrawCanvas initialData={editingNote.content} onChange={(data) => setEditingNote({ ...editingNote, content: data })} />
               </div>
               <div className="flex justify-end gap-2 mt-4">
                 <Button variant="outline" onClick={() => setEditingNote(null)}>Cancel</Button>
-                <Button onClick={() => { updateNote(editingNote.id, { title: editingNote.title, content: editingNote.content }); setEditingNote(null) }}>
-                  Save
-                </Button>
+                <Button onClick={() => { updateNote(editingNote.id, { title: editingNote.title, content: editingNote.content }); setEditingNote(null) }}>Save</Button>
               </div>
             </div>
           )}
         </DialogContent>
       </Dialog>
 
-      {/* ELEMENT EDITOR DIALOG */}
       <Dialog open={!!editingElement} onOpenChange={() => setEditingElement(null)}>
         <DialogContent className="max-w-md">
-          <DialogHeader>
-            <DialogTitle>Edit Element</DialogTitle>
-          </DialogHeader>
+          <DialogHeader><DialogTitle>Edit Element</DialogTitle></DialogHeader>
           {editingElement && (
             <div className="space-y-4">
               {editingElement.type === 'text' && (
-                <Input value={editingElement.text || ''} 
-                  onChange={(e) => setEditingElement({ ...editingElement, text: e.target.value })}
-                  placeholder="Text..." />
+                <Input value={editingElement.text || ''} onChange={(e) => setEditingElement({ ...editingElement, text: e.target.value })} />
               )}
-              
               {editingElement.type === 'simblock' && (
                 <>
                   <div className="flex flex-wrap gap-2">
                     {SIM_BLOCK_TYPES.map(bt => (
-                      <Button key={bt.type} size="sm" 
-                        variant={editingElement.blockType === bt.type ? 'default' : 'outline'}
+                      <Button key={bt.type} size="sm" variant={editingElement.blockType === bt.type ? 'default' : 'outline'}
                         onClick={() => setEditingElement({ ...editingElement, blockType: bt.type as any, color: bt.color })}>
                         {bt.icon} {bt.label}
                       </Button>
                     ))}
                   </div>
-                  <textarea 
-                    className="w-full h-32 p-2 rounded-md border font-mono text-sm bg-zinc-900 text-zinc-100"
-                    value={editingElement.code || ''}
-                    onChange={(e) => setEditingElement({ ...editingElement, code: e.target.value })}
-                    placeholder="// Code here..."
-                  />
+                  <textarea className="w-full h-32 p-2 rounded-md border font-mono text-sm bg-zinc-900 text-zinc-100"
+                    value={editingElement.code || ''} onChange={(e) => setEditingElement({ ...editingElement, code: e.target.value })} />
                 </>
               )}
-              
               <div className="flex justify-end gap-2">
                 <Button variant="outline" onClick={() => setEditingElement(null)}>Cancel</Button>
-                <Button onClick={() => { 
-                  updateCanvasElement(editingElement.id, editingElement); 
-                  setEditingElement(null) 
-                }}>
-                  Save
-                </Button>
+                <Button onClick={() => { updateCanvasElement(editingElement.id, editingElement); setEditingElement(null) }}>Save</Button>
               </div>
             </div>
           )}
         </DialogContent>
       </Dialog>
 
-      {/* TEXT/STICKY EDITOR DIALOG */}
       <Dialog open={!!editingNote && editingNote?.type !== 'CANVAS'} onOpenChange={() => setEditingNote(null)}>
         <DialogContent className="max-w-2xl h-[70vh] flex flex-col">
-          <DialogHeader>
-            <DialogTitle className="flex items-center gap-2">
-              <FileText className="h-4 w-4" /> Edit Note
-            </DialogTitle>
-          </DialogHeader>
+          <DialogHeader><DialogTitle className="flex items-center gap-2"><FileText className="h-4 w-4" /> Edit Note</DialogTitle></DialogHeader>
           {editingNote && editingNote.type !== 'CANVAS' && (
             <div className="flex-1 flex flex-col overflow-hidden">
-              <Input value={editingNote.title} 
-                onChange={(e) => setEditingNote({ ...editingNote, title: e.target.value })}
-                placeholder="Title..." className="mb-4" />
-              <textarea 
-                className={`flex-1 w-full p-4 rounded-md border resize-none ${theme === 'dark' ? 'bg-zinc-800 border-zinc-700' : 'bg-white border-zinc-300'}`}
-                value={editingNote.content}
-                onChange={(e) => setEditingNote({ ...editingNote, content: e.target.value })}
-                placeholder="Write your note..." />
+              <Input value={editingNote.title} onChange={(e) => setEditingNote({ ...editingNote, title: e.target.value })} className="mb-4" />
+              <textarea className={`flex-1 w-full p-4 rounded-md border resize-none ${theme === 'dark' ? 'bg-zinc-800 border-zinc-700' : 'bg-white border-zinc-300'}`}
+                value={editingNote.content} onChange={(e) => setEditingNote({ ...editingNote, content: e.target.value })} />
               <div className="flex justify-end gap-2 mt-4">
                 <Button variant="outline" onClick={() => setEditingNote(null)}>Cancel</Button>
-                <Button onClick={() => { updateNote(editingNote.id, { title: editingNote.title, content: editingNote.content }); setEditingNote(null) }}>
-                  Save
-                </Button>
+                <Button onClick={() => { updateNote(editingNote.id, { title: editingNote.title, content: editingNote.content }); setEditingNote(null) }}>Save</Button>
               </div>
             </div>
           )}
