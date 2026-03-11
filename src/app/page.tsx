@@ -16,7 +16,6 @@ import {
 } from 'lucide-react'
 import dynamic from 'next/dynamic'
 
-// Dynamic import for tldraw (no SSR)
 const TldrawCanvas = dynamic(() => import('@/components/TldrawCanvas').then(mod => mod.TldrawCanvas), { ssr: false })
 
 // ═════════════════════════════════════════════════════════════════
@@ -49,7 +48,6 @@ interface Folder {
   parentId?: string
 }
 
-// Canvas Elements (shapes, lines, text, etc.)
 interface CanvasElement {
   id: string
   type: 'shape' | 'line' | 'arrow' | 'text' | 'simblock'
@@ -57,28 +55,33 @@ interface CanvasElement {
   y: number
   width: number
   height: number
-  // For lines/arrows
   endX?: number
   endY?: number
-  // Style
   color: string
   strokeColor: string
   strokeWidth: number
   fill: boolean
-  // Shape specific
   shapeType?: 'rectangle' | 'circle' | 'triangle' | 'diamond'
-  // Text specific
   text?: string
   fontSize?: number
-  // SimBlock specific
   blockType?: 'input' | 'process' | 'output' | 'condition' | 'loop'
   code?: string
-  // Connection
-  connectedTo?: string
+}
+
+// Connection between elements
+interface Connection {
+  id: string
+  fromId: string
+  fromAnchor: 'top' | 'right' | 'bottom' | 'left'
+  toId: string
+  toAnchor: 'top' | 'right' | 'bottom' | 'left'
+  color: string
+  strokeWidth: number
+  label?: string
+  animated?: boolean
 }
 
 type GridType = 'dots' | 'lines' | 'none'
-
 type ToolType = 'select' | 'pan' | 'note' | 'folder' | 'canvas' | 'sticky' | 
   'text' | 'shape' | 'line' | 'arrow' | 'connect' | 'simblock'
 
@@ -94,6 +97,54 @@ const SIM_BLOCK_TYPES = [
   { type: 'condition', label: 'Condition', color: '#8b5cf6', icon: '❓' },
   { type: 'loop', label: 'Loop', color: '#ef4444', icon: '🔄' },
 ]
+
+// ═════════════════════════════════════════════════════════════════
+// HELPER: Get anchor point position
+// ═════════════════════════════════════════════════════════════════
+
+function getAnchorPosition(
+  element: { x: number; y: number; width: number; height: number },
+  anchor: 'top' | 'right' | 'bottom' | 'left'
+): { x: number; y: number } {
+  const cx = element.x + element.width / 2
+  const cy = element.y + element.height / 2
+  
+  switch (anchor) {
+    case 'top': return { x: cx, y: element.y }
+    case 'right': return { x: element.x + element.width, y: cy }
+    case 'bottom': return { x: cx, y: element.y + element.height }
+    case 'left': return { x: element.x, y: cy }
+  }
+}
+
+function getBestAnchor(
+  from: { x: number; y: number; width: number; height: number },
+  to: { x: number; y: number; width: number; height: number }
+): { fromAnchor: 'top' | 'right' | 'bottom' | 'left'; toAnchor: 'top' | 'right' | 'bottom' | 'left' } {
+  const fromCx = from.x + from.width / 2
+  const fromCy = from.y + from.height / 2
+  const toCx = to.x + to.width / 2
+  const toCy = to.y + to.height / 2
+  
+  const dx = toCx - fromCx
+  const dy = toCy - fromCy
+  
+  if (Math.abs(dx) > Math.abs(dy)) {
+    // Horizontal connection
+    if (dx > 0) {
+      return { fromAnchor: 'right', toAnchor: 'left' }
+    } else {
+      return { fromAnchor: 'left', toAnchor: 'right' }
+    }
+  } else {
+    // Vertical connection
+    if (dy > 0) {
+      return { fromAnchor: 'bottom', toAnchor: 'top' }
+    } else {
+      return { fromAnchor: 'top', toAnchor: 'bottom' }
+    }
+  }
+}
 
 // ═════════════════════════════════════════════════════════════════
 // MAIN COMPONENT
@@ -112,8 +163,9 @@ export default function NeuralNotebook() {
   const [notes, setNotes] = useState<Note[]>([])
   const [folders, setFolders] = useState<Folder[]>([])
   const [canvasElements, setCanvasElements] = useState<CanvasElement[]>([])
+  const [connections, setConnections] = useState<Connection[]>([])
   const [selectedId, setSelectedId] = useState<string | null>(null)
-  const [selectedType, setSelectedType] = useState<'note' | 'folder' | 'element' | null>(null)
+  const [selectedType, setSelectedType] = useState<'note' | 'folder' | 'element' | 'connection' | null>(null)
   
   // Drawing State
   const [isDrawing, setIsDrawing] = useState(false)
@@ -121,6 +173,10 @@ export default function NeuralNotebook() {
   const [currentElement, setCurrentElement] = useState<CanvasElement | null>(null)
   const [shapeType, setShapeType] = useState<'rectangle' | 'circle' | 'triangle' | 'diamond'>('rectangle')
   const [selectedColor, setSelectedColor] = useState(SHAPE_COLORS[0])
+  
+  // Connect State
+  const [connectStart, setConnectStart] = useState<{ id: string; type: 'element' | 'note' | 'folder'; x: number; y: number } | null>(null)
+  const [connectEnd, setConnectEnd] = useState<{ x: number; y: number } | null>(null)
   
   // UI State
   const [theme, setTheme] = useState<'dark' | 'light'>('dark')
@@ -152,6 +208,7 @@ export default function NeuralNotebook() {
           if (data.notes) setNotes(data.notes)
           if (data.folders) setFolders(data.folders)
           if (data.canvasElements) setCanvasElements(data.canvasElements)
+          if (data.connections) setConnections(data.connections)
           if (data.viewport) setViewport(data.viewport)
           if (data.gridType) setGridType(data.gridType)
           if (data.theme) setTheme(data.theme)
@@ -168,9 +225,9 @@ export default function NeuralNotebook() {
 
   useEffect(() => {
     if (!isLoaded) return
-    const data = { notes, folders, canvasElements, viewport, gridType, theme }
+    const data = { notes, folders, canvasElements, connections, viewport, gridType, theme }
     localStorage.setItem(STORAGE_KEY, JSON.stringify(data))
-  }, [notes, folders, canvasElements, viewport, gridType, theme, isLoaded])
+  }, [notes, folders, canvasElements, connections, viewport, gridType, theme, isLoaded])
 
   // ═════════════════════════════════════════════════════════════════
   // ELEMENT CREATION
@@ -223,6 +280,38 @@ export default function NeuralNotebook() {
     return newElement
   }, [])
 
+  const createConnection = useCallback((
+    fromId: string,
+    toId: string,
+    fromAnchor?: 'top' | 'right' | 'bottom' | 'left',
+    toAnchor?: 'top' | 'right' | 'bottom' | 'left'
+  ) => {
+    const fromElement = canvasElements.find(e => e.id === fromId) || 
+                        notes.find(n => n.id === fromId && { x: n.canvasX, y: n.canvasY, width: n.canvasWidth, height: n.canvasHeight })
+    const toElement = canvasElements.find(e => e.id === toId) ||
+                      notes.find(n => n.id === toId && { x: n.canvasX, y: n.canvasY, width: n.canvasWidth, height: n.canvasHeight })
+    
+    if (!fromElement || !toElement) return null
+    
+    const from = 'x' in fromElement ? fromElement : { x: fromElement.canvasX, y: fromElement.canvasY, width: fromElement.canvasWidth, height: fromElement.canvasHeight }
+    const to = 'x' in toElement ? toElement : { x: toElement.canvasX, y: toElement.canvasY, width: toElement.canvasWidth, height: toElement.canvasHeight }
+    
+    const bestAnchors = getBestAnchor(from, to)
+    
+    const newConnection: Connection = {
+      id: `conn-${Date.now()}`,
+      fromId,
+      fromAnchor: fromAnchor || bestAnchors.fromAnchor,
+      toId,
+      toAnchor: toAnchor || bestAnchors.toAnchor,
+      color: '#6b7280',
+      strokeWidth: 2,
+      animated: true
+    }
+    setConnections(prev => [...prev, newConnection])
+    return newConnection
+  }, [canvasElements, notes])
+
   const updateNote = useCallback((id: string, changes: Partial<Note>) => {
     setNotes(prev => prev.map(n => n.id === id ? { ...n, ...changes } : n))
   }, [])
@@ -237,16 +326,24 @@ export default function NeuralNotebook() {
 
   const deleteNote = useCallback((id: string) => {
     setNotes(prev => prev.filter(n => n.id !== id))
+    setConnections(prev => prev.filter(c => c.fromId !== id && c.toId !== id))
     if (selectedId === id) { setSelectedId(null); setSelectedType(null) }
   }, [selectedId])
 
   const deleteFolder = useCallback((id: string) => {
     setFolders(prev => prev.filter(f => f.id !== id))
+    setConnections(prev => prev.filter(c => c.fromId !== id && c.toId !== id))
     if (selectedId === id) { setSelectedId(null); setSelectedType(null) }
   }, [selectedId])
 
   const deleteCanvasElement = useCallback((id: string) => {
     setCanvasElements(prev => prev.filter(e => e.id !== id))
+    setConnections(prev => prev.filter(c => c.fromId !== id && c.toId !== id))
+    if (selectedId === id) { setSelectedId(null); setSelectedType(null) }
+  }, [selectedId])
+
+  const deleteConnection = useCallback((id: string) => {
+    setConnections(prev => prev.filter(c => c.id !== id))
     if (selectedId === id) { setSelectedId(null); setSelectedType(null) }
   }, [selectedId])
 
@@ -277,6 +374,13 @@ export default function NeuralNotebook() {
     if (e.button === 0 && activeTool === 'select') {
       setSelectedId(null)
       setSelectedType(null)
+      setConnectStart(null)
+      return
+    }
+    
+    // Connect mode - handle clicks on elements
+    if (e.button === 0 && activeTool === 'connect') {
+      // This is handled in element mouse down
       return
     }
     
@@ -288,7 +392,6 @@ export default function NeuralNotebook() {
         setIsDrawing(true)
         setDrawStart(coords)
         
-        // Create initial element for shapes/lines/text
         if (activeTool === 'shape') {
           setCurrentElement({
             id: 'temp',
@@ -371,6 +474,12 @@ export default function NeuralNotebook() {
       return
     }
     
+    // Connect mode - update temp line
+    if (activeTool === 'connect' && connectStart) {
+      const coords = getCanvasCoords(e)
+      setConnectEnd(coords)
+    }
+    
     // Drawing
     if (isDrawing && currentElement) {
       const coords = getCanvasCoords(e)
@@ -393,13 +502,12 @@ export default function NeuralNotebook() {
         } : null)
       }
     }
-  }, [isDragging, dragStart, isDrawing, currentElement, drawStart, getCanvasCoords])
+  }, [isDragging, dragStart, isDrawing, currentElement, drawStart, getCanvasCoords, activeTool, connectStart])
 
   const handleCanvasMouseUp = useCallback(() => {
     setIsDragging(false)
     
     if (isDrawing && currentElement && currentElement.id === 'temp') {
-      // Finalize the element
       const { ...elementData } = currentElement
       createCanvasElement(elementData)
       setCurrentElement(null)
@@ -420,30 +528,56 @@ export default function NeuralNotebook() {
   }, [])
 
   // ═════════════════════════════════════════════════════════════════
-  // ELEMENT DRAG & DROP
+  // ELEMENT INTERACTION
   // ═════════════════════════════════════════════════════════════════
 
   const handleElementMouseDown = useCallback((e: React.MouseEvent, id: string, type: 'note' | 'folder' | 'element') => {
     e.stopPropagation()
+    
+    // Connect mode
+    if (activeTool === 'connect') {
+      if (!connectStart) {
+        const element = type === 'element' ? canvasElements.find(el => el.id === id) :
+                        type === 'note' ? notes.find(n => n.id === id) :
+                        folders.find(f => f.id === id)
+        if (element) {
+          const pos = 'x' in element ? { x: element.x + element.width/2, y: element.y + element.height/2 } :
+                      { x: element.canvasX + element.canvasWidth/2, y: element.canvasY + element.canvasHeight/2 }
+          setConnectStart({ id, type, x: pos.x, y: pos.y })
+        }
+      } else {
+        // Complete connection
+        if (connectStart.id !== id) {
+          createConnection(connectStart.id, id)
+        }
+        setConnectStart(null)
+        setConnectEnd(null)
+      }
+      return
+    }
+    
+    // Select mode
     setSelectedId(id)
     setSelectedType(type)
     
-    let element: { canvasX: number; canvasY: number } | undefined
+    let element: { canvasX?: number; canvasY?: number; x?: number; y?: number } | undefined
     if (type === 'note') element = notes.find(n => n.id === id)
     else if (type === 'folder') element = folders.find(f => f.id === id)
     else if (type === 'element') element = canvasElements.find(el => el.id === id)
     
     if (element) {
+      const startX = element.canvasX ?? element.x ?? 0
+      const startY = element.canvasY ?? element.y ?? 0
       setElementDrag({
         id,
         type,
         startX: e.clientX,
         startY: e.clientY,
-        elementStartX: element.canvasX ?? element.x,
-        elementStartY: element.canvasY ?? element.y
+        elementStartX: startX,
+        elementStartY: startY
       })
     }
-  }, [notes, folders, canvasElements])
+  }, [activeTool, connectStart, canvasElements, notes, folders, createConnection])
 
   useEffect(() => {
     if (!elementDrag) return
@@ -486,8 +620,16 @@ export default function NeuralNotebook() {
         if (selectedType === 'note') deleteNote(selectedId)
         else if (selectedType === 'folder') deleteFolder(selectedId)
         else if (selectedType === 'element') deleteCanvasElement(selectedId)
+        else if (selectedType === 'connection') deleteConnection(selectedId)
       }
-      else if (key === 'escape') { setSelectedId(null); setSelectedType(null); setEditingNote(null); setEditingElement(null) }
+      else if (key === 'escape') { 
+        setSelectedId(null)
+        setSelectedType(null)
+        setEditingNote(null)
+        setEditingElement(null)
+        setConnectStart(null)
+        setConnectEnd(null)
+      }
       else if (key === 'v') setActiveTool('select')
       else if (key === 'h') setActiveTool('pan')
       else if (key === 'n') setActiveTool('note')
@@ -500,6 +642,7 @@ export default function NeuralNotebook() {
       else if (key === 'l') setActiveTool('line')
       else if (key === 'a') setActiveTool('arrow')
       else if (key === 'b') setActiveTool('simblock')
+      else if (key === 'k') setActiveTool('connect')
       else if (key === '+' || key === '=') setViewport(prev => ({ ...prev, zoom: prev.zoom * 1.2 }))
       else if (key === '-') setViewport(prev => ({ ...prev, zoom: prev.zoom / 1.2 }))
       else if (key === '0') setViewport({ x: 0, y: 0, zoom: 1 })
@@ -507,14 +650,14 @@ export default function NeuralNotebook() {
     
     window.addEventListener('keydown', handleKeyDown)
     return () => window.removeEventListener('keydown', handleKeyDown)
-  }, [selectedId, selectedType, deleteNote, deleteFolder, deleteCanvasElement])
+  }, [selectedId, selectedType, deleteNote, deleteFolder, deleteCanvasElement, deleteConnection])
 
   // ═════════════════════════════════════════════════════════════════
   // EXPORT / IMPORT
   // ═════════════════════════════════════════════════════════════════
 
   const exportData = useCallback(() => {
-    const data = { notes, folders, canvasElements, viewport, gridType, theme, exportedAt: new Date().toISOString() }
+    const data = { notes, folders, canvasElements, connections, viewport, gridType, theme, exportedAt: new Date().toISOString() }
     const blob = new Blob([JSON.stringify(data, null, 2)], { type: 'application/json' })
     const url = URL.createObjectURL(blob)
     const a = document.createElement('a')
@@ -522,7 +665,7 @@ export default function NeuralNotebook() {
     a.download = `neural-notebook-${Date.now()}.json`
     a.click()
     URL.revokeObjectURL(url)
-  }, [notes, folders, canvasElements, viewport, gridType, theme])
+  }, [notes, folders, canvasElements, connections, viewport, gridType, theme])
 
   const importData = useCallback((e: React.ChangeEvent<HTMLInputElement>) => {
     const file = e.target.files?.[0]
@@ -535,6 +678,7 @@ export default function NeuralNotebook() {
         if (data.notes) setNotes(data.notes)
         if (data.folders) setFolders(data.folders)
         if (data.canvasElements) setCanvasElements(data.canvasElements)
+        if (data.connections) setConnections(data.connections)
         if (data.viewport) setViewport(data.viewport)
         if (data.gridType) setGridType(data.gridType)
         if (data.theme) setTheme(data.theme)
@@ -562,6 +706,20 @@ export default function NeuralNotebook() {
 
   const canvasNotes = notes.filter(n => n.type === 'CANVAS')
 
+  // Get element bounds for connections
+  const getElementBounds = useCallback((id: string): { x: number; y: number; width: number; height: number } | null => {
+    const element = canvasElements.find(e => e.id === id)
+    if (element) return { x: element.x, y: element.y, width: element.width, height: element.height }
+    
+    const note = notes.find(n => n.id === id)
+    if (note) return { x: note.canvasX, y: note.canvasY, width: note.canvasWidth, height: note.canvasHeight }
+    
+    const folder = folders.find(f => f.id === id)
+    if (folder) return { x: folder.canvasX, y: folder.canvasY, width: folder.canvasWidth, height: folder.canvasHeight }
+    
+    return null
+  }, [canvasElements, notes, folders])
+
   // ═════════════════════════════════════════════════════════════════
   // RENDER ELEMENT
   // ═════════════════════════════════════════════════════════════════
@@ -576,83 +734,63 @@ export default function NeuralNotebook() {
       onDoubleClick: () => setEditingElement(element)
     }
 
+    // Show connection anchors when in connect mode
+    const showAnchors = activeTool === 'connect'
+    const anchors = ['top', 'right', 'bottom', 'left'] as const
+
     if (element.type === 'shape') {
-      if (element.shapeType === 'circle') {
-        return (
-          <div key={element.id} {...commonProps}>
-            <div 
-              className="rounded-full"
-              style={{ 
-                width: element.width, 
-                height: element.height,
-                border: `${element.strokeWidth}px solid ${element.strokeColor}`,
-                backgroundColor: element.fill ? element.color : 'transparent'
-              }}
-            />
-            {isSelected && (
-              <Button size="icon" variant="ghost" className="absolute -top-2 -right-2 h-5 w-5 bg-red-500 text-white rounded-full"
-                onClick={(e) => { e.stopPropagation(); deleteCanvasElement(element.id) }}>
-                <X className="h-3 w-3" />
-              </Button>
-            )}
-          </div>
-        )
-      }
+      const shapeContent = element.shapeType === 'circle' ? (
+        <div 
+          className="rounded-full"
+          style={{ 
+            width: element.width, 
+            height: element.height,
+            border: `${element.strokeWidth}px solid ${element.strokeColor}`,
+            backgroundColor: element.fill ? element.color : 'transparent'
+          }}
+        />
+      ) : element.shapeType === 'triangle' ? (
+        <svg width={element.width} height={element.height} viewBox={`0 0 ${element.width} ${element.height}`}>
+          <polygon 
+            points={`${element.width/2},0 ${element.width},${element.height} 0,${element.height}`}
+            fill={element.fill ? element.color : 'transparent'}
+            stroke={element.strokeColor}
+            strokeWidth={element.strokeWidth}
+          />
+        </svg>
+      ) : element.shapeType === 'diamond' ? (
+        <svg width={element.width} height={element.height} viewBox={`0 0 ${element.width} ${element.height}`}>
+          <polygon 
+            points={`${element.width/2},0 ${element.width},${element.height/2} ${element.width/2},${element.height} 0,${element.height/2}`}
+            fill={element.fill ? element.color : 'transparent'}
+            stroke={element.strokeColor}
+            strokeWidth={element.strokeWidth}
+          />
+        </svg>
+      ) : (
+        <div 
+          className="rounded"
+          style={{ 
+            width: element.width, 
+            height: element.height,
+            border: `${element.strokeWidth}px solid ${element.strokeColor}`,
+            backgroundColor: element.fill ? element.color : 'transparent'
+          }}
+        />
+      )
       
-      if (element.shapeType === 'triangle') {
-        return (
-          <div key={element.id} {...commonProps}>
-            <svg width={element.width} height={element.height} viewBox={`0 0 ${element.width} ${element.height}`}>
-              <polygon 
-                points={`${element.width/2},0 ${element.width},${element.height} 0,${element.height}`}
-                fill={element.fill ? element.color : 'transparent'}
-                stroke={element.strokeColor}
-                strokeWidth={element.strokeWidth}
-              />
-            </svg>
-            {isSelected && (
-              <Button size="icon" variant="ghost" className="absolute -top-2 -right-2 h-5 w-5 bg-red-500 text-white rounded-full"
-                onClick={(e) => { e.stopPropagation(); deleteCanvasElement(element.id) }}>
-                <X className="h-3 w-3" />
-              </Button>
-            )}
-          </div>
-        )
-      }
-      
-      if (element.shapeType === 'diamond') {
-        return (
-          <div key={element.id} {...commonProps}>
-            <svg width={element.width} height={element.height} viewBox={`0 0 ${element.width} ${element.height}`}>
-              <polygon 
-                points={`${element.width/2},0 ${element.width},${element.height/2} ${element.width/2},${element.height} 0,${element.height/2}`}
-                fill={element.fill ? element.color : 'transparent'}
-                stroke={element.strokeColor}
-                strokeWidth={element.strokeWidth}
-              />
-            </svg>
-            {isSelected && (
-              <Button size="icon" variant="ghost" className="absolute -top-2 -right-2 h-5 w-5 bg-red-500 text-white rounded-full"
-                onClick={(e) => { e.stopPropagation(); deleteCanvasElement(element.id) }}>
-                <X className="h-3 w-3" />
-              </Button>
-            )}
-          </div>
-        )
-      }
-      
-      // Rectangle (default)
       return (
         <div key={element.id} {...commonProps}>
-          <div 
-            className="rounded"
-            style={{ 
-              width: element.width, 
-              height: element.height,
-              border: `${element.strokeWidth}px solid ${element.strokeColor}`,
-              backgroundColor: element.fill ? element.color : 'transparent'
-            }}
-          />
+          {shapeContent}
+          {showAnchors && anchors.map(anchor => {
+            const pos = getAnchorPosition(element, anchor)
+            return (
+              <div key={anchor}
+                className="absolute w-3 h-3 bg-blue-500 rounded-full cursor-crosshair transform -translate-x-1/2 -translate-y-1/2 hover:scale-150 transition-transform"
+                style={{ left: pos.x - element.x, top: pos.y - element.y }}
+              />
+            )
+          })}
           {isSelected && (
             <Button size="icon" variant="ghost" className="absolute -top-2 -right-2 h-5 w-5 bg-red-500 text-white rounded-full"
               onClick={(e) => { e.stopPropagation(); deleteCanvasElement(element.id) }}>
@@ -667,23 +805,18 @@ export default function NeuralNotebook() {
       const dx = (element.endX || element.x) - element.x
       const dy = (element.endY || element.y) - element.y
       const length = Math.sqrt(dx * dx + dy * dy)
-      const angle = Math.atan2(dy, dx) * 180 / Math.PI
       
       return (
         <div key={element.id} 
           className={`absolute cursor-move ${isSelected ? 'ring-2 ring-blue-500' : ''}`}
           style={{ left: element.x, top: element.y }}
           onMouseDown={(e) => handleElementMouseDown(e, element.id, 'element')}>
-          <svg 
-            width={length + 20} 
-            height={Math.abs(dy) + 20}
-            style={{ overflow: 'visible' }}
-          >
+          <svg width={Math.max(Math.abs(dx) + 20, 50)} height={Math.abs(dy) + 20} style={{ overflow: 'visible' }}>
             <line
-              x1={10}
-              y1={10}
-              x2={length + 10}
-              y2={dy + 10}
+              x1={0}
+              y1={0}
+              x2={dx}
+              y2={dy}
               stroke={element.strokeColor}
               strokeWidth={element.strokeWidth}
               markerEnd={element.type === 'arrow' ? 'url(#arrowhead)' : undefined}
@@ -710,11 +843,8 @@ export default function NeuralNotebook() {
       return (
         <div key={element.id} {...commonProps}>
           <div 
-            className="px-2 py-1 min-w-[50px]"
-            style={{ 
-              fontSize: element.fontSize || 14,
-              color: element.color
-            }}
+            className="px-2 py-1 min-w-[50px] bg-zinc-900/80 rounded"
+            style={{ fontSize: element.fontSize || 14, color: element.color }}
           >
             {element.text || 'Text'}
           </div>
@@ -735,12 +865,7 @@ export default function NeuralNotebook() {
         <div key={element.id} {...commonProps}>
           <Card 
             className="flex flex-col overflow-hidden shadow-lg"
-            style={{ 
-              width: element.width, 
-              height: element.height,
-              borderColor: blockInfo.color,
-              borderWidth: 2
-            }}
+            style={{ width: element.width, height: element.height, borderColor: blockInfo.color, borderWidth: 2 }}
           >
             <div className="px-2 py-1 text-xs font-bold flex items-center gap-1" style={{ backgroundColor: blockInfo.color }}>
               <span>{blockInfo.icon}</span>
@@ -750,6 +875,15 @@ export default function NeuralNotebook() {
               {element.code || '// code'}
             </div>
           </Card>
+          {showAnchors && anchors.map(anchor => {
+            const pos = getAnchorPosition(element, anchor)
+            return (
+              <div key={anchor}
+                className="absolute w-3 h-3 bg-blue-500 rounded-full cursor-crosshair transform -translate-x-1/2 -translate-y-1/2 hover:scale-150 transition-transform z-10"
+                style={{ left: pos.x - element.x, top: pos.y - element.y }}
+              />
+            )
+          })}
           {isSelected && (
             <Button size="icon" variant="ghost" className="absolute -top-2 -right-2 h-5 w-5 bg-red-500 text-white rounded-full"
               onClick={(e) => { e.stopPropagation(); deleteCanvasElement(element.id) }}>
@@ -761,7 +895,76 @@ export default function NeuralNotebook() {
     }
     
     return null
-  }, [selectedId, selectedType, handleElementMouseDown, deleteCanvasElement])
+  }, [selectedId, selectedType, handleElementMouseDown, deleteCanvasElement, activeTool])
+
+  // ═════════════════════════════════════════════════════════════════
+  // RENDER CONNECTIONS
+  // ═════════════════════════════════════════════════════════════════
+
+  const renderConnections = useCallback(() => {
+    return connections.map(conn => {
+      const fromBounds = getElementBounds(conn.fromId)
+      const toBounds = getElementBounds(conn.toId)
+      
+      if (!fromBounds || !toBounds) return null
+      
+      const from = getAnchorPosition(fromBounds, conn.fromAnchor)
+      const to = getAnchorPosition(toBounds, conn.toAnchor)
+      
+      // Calculate control points for bezier curve
+      const dx = to.x - from.x
+      const dy = to.y - from.y
+      const dist = Math.sqrt(dx * dx + dy * dy)
+      const offset = Math.min(dist / 3, 50)
+      
+      let cp1x = from.x, cp1y = from.y
+      let cp2x = to.x, cp2y = to.y
+      
+      if (conn.fromAnchor === 'right') { cp1x += offset }
+      else if (conn.fromAnchor === 'left') { cp1x -= offset }
+      else if (conn.fromAnchor === 'bottom') { cp1y += offset }
+      else if (conn.fromAnchor === 'top') { cp1y -= offset }
+      
+      if (conn.toAnchor === 'right') { cp2x += offset }
+      else if (conn.toAnchor === 'left') { cp2x -= offset }
+      else if (conn.toAnchor === 'bottom') { cp2y += offset }
+      else if (conn.toAnchor === 'top') { cp2y -= offset }
+      
+      const isSelected = selectedId === conn.id && selectedType === 'connection'
+      
+      return (
+        <g key={conn.id} 
+          className="cursor-pointer"
+          onClick={() => { setSelectedId(conn.id); setSelectedType('connection') }}>
+          {/* Invisible wider path for easier clicking */}
+          <path
+            d={`M ${from.x} ${from.y} C ${cp1x} ${cp1y}, ${cp2x} ${cp2y}, ${to.x} ${to.y}`}
+            fill="none"
+            stroke="transparent"
+            strokeWidth={20}
+          />
+          {/* Visible path */}
+          <path
+            d={`M ${from.x} ${from.y} C ${cp1x} ${cp1y}, ${cp2x} ${cp2y}, ${to.x} ${to.y}`}
+            fill="none"
+            stroke={isSelected ? '#3b82f6' : conn.color}
+            strokeWidth={conn.strokeWidth}
+            strokeDasharray={conn.animated ? '5,5' : undefined}
+            markerEnd="url(#conn-arrow)"
+          />
+          {/* Arrow marker */}
+          <defs>
+            <marker id="conn-arrow" markerWidth="10" markerHeight="7" refX="9" refY="3.5" orient="auto">
+              <polygon points="0 0, 10 3.5, 0 7" fill={isSelected ? '#3b82f6' : conn.color} />
+            </marker>
+          </defs>
+          {isSelected && (
+            <circle cx={from.x} cy={from.y} r={5} fill="#3b82f6" />
+          )}
+        </g>
+      )
+    })
+  }, [connections, selectedId, selectedType, getElementBounds])
 
   // ═════════════════════════════════════════════════════════════════
   // RENDER
@@ -787,7 +990,6 @@ export default function NeuralNotebook() {
           
           {/* Tools */}
           <div className="flex items-center gap-1">
-            {/* Select & Pan */}
             <Button size="icon" variant={activeTool === 'select' ? 'default' : 'ghost'} 
               onClick={() => setActiveTool('select')} className="h-8 w-8" title="Select (V)">
               <MousePointer className="h-4 w-4" />
@@ -799,7 +1001,6 @@ export default function NeuralNotebook() {
             
             <Separator orientation="vertical" className="h-6 mx-1" />
             
-            {/* Notes */}
             <Button size="icon" variant={activeTool === 'note' ? 'default' : 'ghost'} 
               onClick={() => setActiveTool('note')} className="h-8 w-8" title="Note (N)">
               <FileText className="h-4 w-4" />
@@ -815,19 +1016,16 @@ export default function NeuralNotebook() {
             
             <Separator orientation="vertical" className="h-6 mx-1" />
             
-            {/* Drawing Tools */}
             <Button size="icon" variant={activeTool === 'text' ? 'default' : 'ghost'} 
               onClick={() => setActiveTool('text')} className="h-8 w-8" title="Text (T)">
               <Type className="h-4 w-4" />
             </Button>
             
-            {/* Shape Selector */}
             <div className="relative">
               <Button size="icon" variant={activeTool === 'shape' ? 'default' : 'ghost'} 
                 onClick={() => setActiveTool('shape')} className="h-8 w-8" title="Shape (R/O)">
                 {shapeType === 'circle' ? <Circle className="h-4 w-4" /> : 
                  shapeType === 'triangle' ? <Triangle className="h-4 w-4" /> : 
-                 shapeType === 'diamond' ? <Square className="h-4 w-4 rotate-45" /> :
                  <Square className="h-4 w-4" />}
               </Button>
               {activeTool === 'shape' && (
@@ -857,6 +1055,12 @@ export default function NeuralNotebook() {
             
             <Separator orientation="vertical" className="h-6 mx-1" />
             
+            {/* Connect Tool */}
+            <Button size="icon" variant={activeTool === 'connect' ? 'default' : 'ghost'} 
+              onClick={() => setActiveTool('connect')} className="h-8 w-8" title="Connect (K)">
+              <Link2 className="h-4 w-4" />
+            </Button>
+            
             {/* SimBlock */}
             <Button size="icon" variant={activeTool === 'simblock' ? 'default' : 'ghost'} 
               onClick={() => setActiveTool('simblock')} className="h-8 w-8" title="Sim Block (B)">
@@ -865,7 +1069,7 @@ export default function NeuralNotebook() {
           </div>
           
           {/* Color Picker */}
-          {(activeTool === 'shape' || activeTool === 'line' || activeTool === 'arrow' || activeTool === 'text') && (
+          {(activeTool === 'shape' || activeTool === 'line' || activeTool === 'arrow' || activeTool === 'text' || activeTool === 'connect') && (
             <div className="flex items-center gap-1 ml-2">
               {SHAPE_COLORS.slice(0, 6).map(color => (
                 <button key={color} 
@@ -893,7 +1097,6 @@ export default function NeuralNotebook() {
 
         {/* Right */}
         <div className="flex items-center gap-3">
-          {/* Grid */}
           <div className={`flex items-center gap-1 rounded-md p-1 ${theme === 'dark' ? 'bg-zinc-800' : 'bg-zinc-200'}`}>
             {(['dots', 'lines', 'none'] as GridType[]).map(g => (
               <Button key={g} size="icon" variant={gridType === g ? 'secondary' : 'ghost'} 
@@ -967,6 +1170,27 @@ export default function NeuralNotebook() {
                         </div>
                       ))}
                     </div>
+                    
+                    {/* Connections */}
+                    {connections.length > 0 && (
+                      <div className="mt-4">
+                        <div className="text-xs text-zinc-500 mb-2 px-2">Connections ({connections.length})</div>
+                        {connections.map(conn => (
+                          <div key={conn.id}
+                            className={`flex items-center gap-2 p-2 rounded-md cursor-pointer ${
+                              selectedId === conn.id ? 'bg-blue-600 text-white' : theme === 'dark' ? 'hover:bg-zinc-800' : 'hover:bg-zinc-100'
+                            }`}
+                            onClick={() => { setSelectedId(conn.id); setSelectedType('connection') }}>
+                            <Link2 className="h-4 w-4" />
+                            <span className="text-xs truncate flex-1">{conn.fromId.slice(0, 8)} → {conn.toId.slice(0, 8)}</span>
+                            <Button size="icon" variant="ghost" className="h-5 w-5"
+                              onClick={(e) => { e.stopPropagation(); deleteConnection(conn.id) }}>
+                              <X className="h-3 w-3" />
+                            </Button>
+                          </div>
+                        ))}
+                      </div>
+                    )}
                   </div>
                 </ScrollArea>
               </TabsContent>
@@ -976,77 +1200,26 @@ export default function NeuralNotebook() {
                   <div className="py-2 space-y-2">
                     <div className="text-xs text-zinc-500 px-2">Canvas Elements ({canvasElements.length})</div>
                     
-                    {/* Quick Add Buttons */}
                     <div className="grid grid-cols-2 gap-2 mb-4">
-                      <Button size="sm" variant="outline" onClick={() => {
-                        setActiveTool('simblock')
-                        createCanvasElement({
-                          type: 'simblock',
-                          x: (-viewport.x + 200) / viewport.zoom,
-                          y: (-viewport.y + 200) / viewport.zoom,
-                          width: 160,
-                          height: 80,
-                          color: SIM_BLOCK_TYPES[0].color,
-                          strokeColor: '#333',
-                          strokeWidth: 2,
-                          fill: true,
-                          blockType: 'input',
-                          code: '// Input'
-                        })
-                      }}>
-                        📥 Input
-                      </Button>
-                      <Button size="sm" variant="outline" onClick={() => {
-                        createCanvasElement({
-                          type: 'simblock',
-                          x: (-viewport.x + 200) / viewport.zoom,
-                          y: (-viewport.y + 200) / viewport.zoom,
-                          width: 160,
-                          height: 80,
-                          color: SIM_BLOCK_TYPES[1].color,
-                          strokeColor: '#333',
-                          strokeWidth: 2,
-                          fill: true,
-                          blockType: 'process',
-                          code: '// Process'
-                        })
-                      }}>
-                        ⚙️ Process
-                      </Button>
-                      <Button size="sm" variant="outline" onClick={() => {
-                        createCanvasElement({
-                          type: 'simblock',
-                          x: (-viewport.x + 200) / viewport.zoom,
-                          y: (-viewport.y + 200) / viewport.zoom,
-                          width: 160,
-                          height: 80,
-                          color: SIM_BLOCK_TYPES[3].color,
-                          strokeColor: '#333',
-                          strokeWidth: 2,
-                          fill: true,
-                          blockType: 'condition',
-                          code: '// Condition'
-                        })
-                      }}>
-                        ❓ Condition
-                      </Button>
-                      <Button size="sm" variant="outline" onClick={() => {
-                        createCanvasElement({
-                          type: 'simblock',
-                          x: (-viewport.x + 200) / viewport.zoom,
-                          y: (-viewport.y + 200) / viewport.zoom,
-                          width: 160,
-                          height: 80,
-                          color: SIM_BLOCK_TYPES[4].color,
-                          strokeColor: '#333',
-                          strokeWidth: 2,
-                          fill: true,
-                          blockType: 'loop',
-                          code: '// Loop'
-                        })
-                      }}>
-                        🔄 Loop
-                      </Button>
+                      {SIM_BLOCK_TYPES.map(bt => (
+                        <Button key={bt.type} size="sm" variant="outline" onClick={() => {
+                          createCanvasElement({
+                            type: 'simblock',
+                            x: (-viewport.x + 200) / viewport.zoom,
+                            y: (-viewport.y + 200) / viewport.zoom,
+                            width: 160,
+                            height: 80,
+                            color: bt.color,
+                            strokeColor: '#333',
+                            strokeWidth: 2,
+                            fill: true,
+                            blockType: bt.type as any,
+                            code: `// ${bt.label}`
+                          })
+                        }}>
+                          {bt.icon} {bt.label}
+                        </Button>
+                      ))}
                     </div>
                     
                     {canvasElements.map(element => (
@@ -1081,7 +1254,7 @@ export default function NeuralNotebook() {
 
         {/* Canvas */}
         <div ref={canvasRef}
-          className={`absolute inset-0 ${isDragging ? 'cursor-grabbing' : activeTool === 'pan' ? 'cursor-grab' : 'cursor-default'}`}
+          className={`absolute inset-0 ${isDragging ? 'cursor-grabbing' : activeTool === 'pan' ? 'cursor-grab' : activeTool === 'connect' ? 'cursor-crosshair' : 'cursor-default'}`}
           onMouseDown={handleCanvasMouseDown} 
           onMouseMove={handleCanvasMouseMove} 
           onMouseUp={handleCanvasMouseUp} 
@@ -1106,6 +1279,24 @@ export default function NeuralNotebook() {
 
           {/* Viewport Content */}
           <div className="absolute" style={{ transform: `translate(${viewport.x}px, ${viewport.y}px) scale(${viewport.zoom})`, transformOrigin: '0 0' }}>
+            
+            {/* Connections SVG Layer */}
+            <svg className="absolute inset-0 w-full h-full pointer-events-none" style={{ overflow: 'visible' }}>
+              {renderConnections()}
+              
+              {/* Temp connection while connecting */}
+              {connectStart && connectEnd && (
+                <line
+                  x1={connectStart.x}
+                  y1={connectStart.y}
+                  x2={connectEnd.x}
+                  y2={connectEnd.y}
+                  stroke="#3b82f6"
+                  strokeWidth={2}
+                  strokeDasharray="5,5"
+                />
+              )}
+            </svg>
             
             {/* Canvas Elements */}
             {canvasElements.map(renderCanvasElement)}
@@ -1210,6 +1401,13 @@ export default function NeuralNotebook() {
             <Grid3X3 className="h-4 w-4" />
           </Button>
         )}
+        
+        {/* Connect Mode Indicator */}
+        {activeTool === 'connect' && (
+          <div className={`absolute bottom-16 left-1/2 transform -translate-x-1/2 px-4 py-2 rounded-full ${theme === 'dark' ? 'bg-blue-600' : 'bg-blue-500'} text-white text-sm`}>
+            {connectStart ? 'Klicke auf ein anderes Element zum Verbinden' : 'Klicke auf ein Element um Verbindung zu starten'}
+          </div>
+        )}
       </div>
 
       {/* FOOTER */}
@@ -1217,7 +1415,7 @@ export default function NeuralNotebook() {
         <div className="flex items-center gap-4">
           <span>Position: {Math.round(-viewport.x / viewport.zoom)}, {Math.round(-viewport.y / viewport.zoom)}</span>
           <span>|</span>
-          <span>{notes.length} Notes, {folders.length} Folders, {canvasElements.length} Elements</span>
+          <span>{notes.length} Notes, {folders.length} Folders, {canvasElements.length} Elements, {connections.length} Connections</span>
         </div>
         <div className="flex items-center gap-2">
           <span className="text-zinc-400">Tool: {activeTool}</span>
@@ -1269,7 +1467,7 @@ export default function NeuralNotebook() {
               
               {editingElement.type === 'simblock' && (
                 <>
-                  <div className="flex gap-2">
+                  <div className="flex flex-wrap gap-2">
                     {SIM_BLOCK_TYPES.map(bt => (
                       <Button key={bt.type} size="sm" 
                         variant={editingElement.blockType === bt.type ? 'default' : 'outline'}
@@ -1279,7 +1477,7 @@ export default function NeuralNotebook() {
                     ))}
                   </div>
                   <textarea 
-                    className="w-full h-32 p-2 rounded-md border font-mono text-sm"
+                    className="w-full h-32 p-2 rounded-md border font-mono text-sm bg-zinc-900 text-zinc-100"
                     value={editingElement.code || ''}
                     onChange={(e) => setEditingElement({ ...editingElement, code: e.target.value })}
                     placeholder="// Code here..."
